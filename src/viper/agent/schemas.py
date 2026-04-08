@@ -31,13 +31,21 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file. Use to inspect dependency files, config, etc.",
+            "description": "Read the contents of a file. Supports optional offset/limit for reading specific line ranges of large files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Relative path from project root",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Starting line number (1-based). Optional.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of lines to read from offset. Optional, default reads all.",
                     },
                 },
                 "required": ["path"],
@@ -118,7 +126,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Search for files matching a glob pattern or grep for text in files.",
+            "description": "Search for files matching a glob pattern, or grep for text in files (returns matching lines with line numbers).",
             "parameters": {
                 "type": "object",
                 "properties": {

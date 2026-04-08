@@ -162,8 +162,10 @@ class ToolExecutor:
         except Exception as e:
             return f"Error executing command: {e}"
 
-    def _tool_read_file(self, path: str) -> str:
-        """Read file contents."""
+    def _tool_read_file(
+        self, path: str, offset: int | None = None, limit: int | None = None
+    ) -> str:
+        """Read file contents, optionally a specific line range."""
         resolved = self._resolve_path(path)
         if self._is_ignored(resolved):
             return f"Error: Path is in an ignored directory (node_modules, .venv, etc.): {path}"
@@ -173,9 +175,20 @@ class ToolExecutor:
             return f"Error: Not a file: {path}"
 
         content = resolved.read_text(errors="replace")
-        if len(content) > 50000:
-            content = content[:25000] + "\n\n... (truncated) ...\n\n" + content[-15000:]
-        return content
+        lines = content.splitlines(keepends=True)
+
+        if offset is not None or limit is not None:
+            start = (offset or 1) - 1  # 1-based to 0-based
+            start = max(0, start)
+            end = start + (limit or 200)
+            selected = lines[start:end]
+            header = f"Lines {start + 1}-{min(end, len(lines))} of {len(lines)}:\n"
+            return header + "".join(selected)
+
+        result = "".join(lines)
+        if len(result) > 50000:
+            result = result[:25000] + "\n\n... (truncated) ...\n\n" + result[-15000:]
+        return result
 
     def _tool_write_file(self, path: str, content: str) -> str:
         """Write content to a file."""
@@ -246,23 +259,27 @@ class ToolExecutor:
         resolved = self._resolve_path(path)
 
         if mode == "grep":
+            # Build exclude args for ignored dirs
+            exclude_args = []
+            for d in IGNORED_DIRS:
+                exclude_args.extend(["--exclude-dir", d])
             try:
                 result = subprocess.run(
-                    ["grep", "-r", "-l", "--include=*", "-m", "20", pattern, str(resolved)],
+                    ["grep", "-r", "-n", *exclude_args, pattern, str(resolved)],
                     capture_output=True,
                     text=True,
                     timeout=30,
                 )
                 if result.stdout:
-                    # Make paths relative
                     lines = []
                     for line in result.stdout.strip().split("\n"):
-                        try:
-                            rel = Path(line).relative_to(self.project_dir)
-                            lines.append(str(rel))
-                        except ValueError:
-                            lines.append(line)
-                    return "\n".join(lines[:50])
+                        # Make paths relative: /abs/project/dir/file.txt:10:match -> file.txt:10:match
+                        if line.startswith(str(self.project_dir)):
+                            line = line[len(str(self.project_dir)) + 1:]
+                        lines.append(line)
+                        if len(lines) >= 50:
+                            break
+                    return "\n".join(lines)
                 return "No matches found"
             except Exception as e:
                 return f"Error: {e}"
