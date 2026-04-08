@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -27,11 +28,20 @@ class SnykParser:
         if severity_threshold:
             cmd.extend(["--severity-threshold", severity_threshold])
 
-        env = None
+        # Build env: always inherit parent env so SNYK_TOKEN from shell works.
+        # Only override if an explicit token is provided via config.
+        env = {**os.environ}
         if snyk_token:
-            import os
+            env["SNYK_TOKEN"] = snyk_token
 
-            env = {**os.environ, "SNYK_TOKEN": snyk_token}
+        # Check SNYK_TOKEN is available
+        if not env.get("SNYK_TOKEN"):
+            raise ViperScanError(
+                "SNYK_TOKEN not set. Either:\n"
+                "  1. Set the SNYK_TOKEN environment variable: export SNYK_TOKEN=<token>\n"
+                "  2. Run `snyk auth` to authenticate interactively\n"
+                "  3. Add snyk.token to viper.yaml (run `viper init` to create one)"
+            )
 
         try:
             result = subprocess.run(
@@ -49,17 +59,39 @@ class SnykParser:
         except subprocess.TimeoutExpired:
             raise ViperScanError("Snyk scan timed out after 600 seconds")
 
-        # Exit code 0 = no vulns, 1 = vulns found, 2+ = error
+        # Try to parse JSON from stdout even on error — snyk puts error details there
+        if result.stdout.strip():
+            try:
+                data = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                data = None
+        else:
+            data = None
+
+        # Exit code 0 = no vulns, 1 = vulns found, 2 = action needed, 3 = no supported files
         if result.returncode >= 2:
-            raise ViperScanError(f"Snyk scan failed (exit {result.returncode}): {result.stderr}")
+            # Extract useful error message from JSON if available
+            error_msg = ""
+            if isinstance(data, dict):
+                error_msg = data.get("error", "") or data.get("message", "")
+            if not error_msg:
+                error_msg = result.stderr.strip() or result.stdout.strip()
 
-        if not result.stdout.strip():
+            # Provide actionable hints for common errors
+            hint = ""
+            if result.returncode == 3 or "no supported" in error_msg.lower():
+                hint = "\nHint: No supported manifest files found. Make sure the project directory contains package.json, requirements.txt, pom.xml, etc."
+            elif "auth" in error_msg.lower() or "unauthorized" in error_msg.lower():
+                hint = "\nHint: Authentication failed. Check your SNYK_TOKEN or run `snyk auth`."
+            elif "could not detect" in error_msg.lower():
+                hint = "\nHint: Snyk couldn't detect the project type. Ensure you're pointing at a directory with dependency files."
+
+            raise ViperScanError(
+                f"Snyk scan failed (exit {result.returncode}): {error_msg}{hint}"
+            )
+
+        if data is None:
             raise ViperScanError("Snyk returned empty output")
-
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError as e:
-            raise ViperParseError(f"Failed to parse Snyk JSON output: {e}")
 
         return SnykParser.parse_json(data)
 
