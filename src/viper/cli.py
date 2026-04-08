@@ -37,7 +37,6 @@ def _get_report(
     project_dir: Path | None,
     report_file: Path | None,
     config: ViperConfig,
-    severity: str | None,
 ) -> SnykReport:
     """Run Snyk scan or load existing report."""
     if report_file:
@@ -50,7 +49,6 @@ def _get_report(
         project_dir=project_dir,
         snyk_token=config.snyk.token or None,
         org=config.snyk.org or None,
-        severity_threshold=severity or config.severity_threshold,
     )
 
 
@@ -195,7 +193,7 @@ def scan(
     """Run Snyk scan and display vulnerabilities."""
     try:
         cfg = _load_config(config)
-        report = _get_report(project_dir, report_file, cfg, severity)
+        report = _get_report(project_dir, report_file, cfg)
 
         if output == "json":
             console.print_json(report.model_dump_json(indent=2))
@@ -226,7 +224,7 @@ def fix(
         if max_iterations:
             cfg.agent.max_iterations = max_iterations
 
-        report = _get_report(project_dir, report_file, cfg, severity)
+        report = _get_report(project_dir, report_file, cfg)
 
         if report.ok and not report.vulnerabilities:
             console.print("[green]No vulnerabilities found![/green]")
@@ -269,7 +267,7 @@ def report(
     """Generate a vulnerability remediation report."""
     try:
         cfg = _load_config(config)
-        snyk_report = _get_report(project_dir, report_file, cfg, severity)
+        snyk_report = _get_report(project_dir, report_file, cfg)
 
         from viper.report_generator import ReportGenerator
 
@@ -308,7 +306,7 @@ def mr(
         if target_branch:
             cfg.gitlab.target_branch = target_branch
 
-        report = _get_report(project_dir, report_file, cfg, severity)
+        report = _get_report(project_dir, report_file, cfg)
 
         if report.ok and not report.vulnerabilities:
             console.print("[green]No vulnerabilities found![/green]")
@@ -374,7 +372,6 @@ def auto(
                     project_dir=target_dir,
                     snyk_token=cfg.snyk.token or None,
                     org=cfg.snyk.org or None,
-                    severity_threshold=sev_threshold,
                 )
             except ViperError as e:
                 console.print(f"[red]Scan error:[/red] {e}")

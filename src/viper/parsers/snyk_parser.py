@@ -19,22 +19,14 @@ class SnykParser:
         project_dir: Path,
         snyk_token: str | None = None,
         org: str | None = None,
-        severity_threshold: str | None = None,
     ) -> SnykReport:
         """Run `snyk test --json` and return parsed report."""
         cmd = ["snyk", "test", "--json"]
         if org:
             cmd.extend(["--org", org])
-        if severity_threshold:
-            # Snyk only accepts: low, medium, high, critical (lowercase)
-            normalized = severity_threshold.strip().lower()
-            valid = {"low", "medium", "high", "critical"}
-            if normalized not in valid:
-                raise ViperScanError(
-                    f"Invalid severity threshold '{severity_threshold}'. "
-                    f"Must be one of: {', '.join(sorted(valid))}"
-                )
-            cmd.extend(["--severity-threshold", normalized])
+        # NOTE: We intentionally do NOT pass --severity-threshold to Snyk.
+        # Some Snyk CLI versions/project types reject it. Instead, we fetch
+        # all vulnerabilities and filter by severity on our side.
 
         # Build env: always inherit parent env so SNYK_TOKEN from shell works.
         # Only override if an explicit token is provided via config.
