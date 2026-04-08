@@ -196,10 +196,11 @@ class ViperAgent:
                     "role": "user",
                     "content": (
                         "You have not edited any files yet. You MUST call `edit_file` to "
-                        "change the vulnerable package versions. For example:\n"
-                        'edit_file(path="package.json", old_string=\'"fast-xml-parser": "5.4.1"\', '
-                        'new_string=\'"fast-xml-parser": "5.6.0"\')\n'
-                        "Do it NOW. Call edit_file on the dependency files."
+                        "fix vulnerabilities. If the vulnerable package is not a direct "
+                        "dependency, add an npm overrides section to package.json to force "
+                        "the transitive dependency to a safe version. If you truly cannot "
+                        "fix it, call `done()` with an explanation. Do NOT just read files "
+                        "— take action NOW."
                     ),
                 })
                 continue

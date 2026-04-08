@@ -12,35 +12,49 @@ CRITICAL RULES:
 - You MUST actually edit files. Your job is to CHANGE dependency versions, not just read them.
 - Focus ONLY on vulnerabilities marked "Upgradable: Yes" — those have a known fix version.
 - For non-upgradable vulnerabilities, skip them and note them in your done() summary.
+- ALWAYS call done() when you are finished, even if you could not fix all vulnerabilities.
 
-EXACT WORKFLOW — follow these steps strictly:
+WORKFLOW:
 
 Step 1: Find dependency files
-- Call `search_files` with pattern "package.json" or "requirements.txt" or "pom.xml"
-- This finds all dependency files across the monorepo
+- Call `search_files` with pattern "package.json" (or requirements.txt, pom.xml)
 
-Step 2: For EACH upgradable vulnerability, fix it:
-  a) Call `read_file` on the dependency file that contains the vulnerable package
-  b) Call `create_backup` on that file
-  c) Call `edit_file` to change the version string from the old version to the suggested upgrade version
-     Example: edit_file(path="package.json", old_string='"lodash": "4.17.15"', new_string='"lodash": "4.17.21"')
-     Example: edit_file(path="requirements.txt", old_string="requests==2.28.0", new_string="requests==2.31.0")
-     Example: edit_file(path="pom.xml", old_string="<version>2.14.1</version>", new_string="<version>2.17.1</version>")
-  d) After editing all vulnerable packages in a file, run install:
-     - Node.js: `bash("npm install")` in the directory containing package.json
-     - Python: `bash("pip install -r requirements.txt")`
-     - Maven: `bash("mvn dependency:resolve -q")`
+Step 2: For each vulnerable package, determine if it is DIRECT or TRANSITIVE:
+- Call `bash("grep -r \\"packageName\\" package.json")` to check if it appears in dependencies
+- If the package IS in dependencies/devDependencies: edit the version directly
+- If the package is NOT in any package.json (it is a transitive/nested dependency): use the override method below
 
-Step 3: Run tests (optional, skip if no test setup exists)
-  - Node.js: `bash("npm test")`
-  - Python: `bash("pytest")`
-  - Maven: `bash("mvn test -q")`
-  - If tests fail, call `restore_backup` and try a smaller version bump
+Step 3a: DIRECT dependency fix:
+  a) read_file the package.json
+  b) create_backup on it
+  c) edit_file to update the version
+  d) bash("npm install") in that directory
 
-Step 4: Call `done()` with:
-  - summary: what packages were upgraded and to what versions
+Step 3b: TRANSITIVE dependency fix (package not directly in package.json):
+  a) Run `bash("npm ls packageName")` to find which direct dependency pulls it in
+  b) read_file the root package.json
+  c) create_backup on it
+  d) Add an "overrides" section to force the transitive dep to a safe version.
+     If package.json has no "overrides" field, add it. Example:
+     edit_file(path="package.json",
+       old_string='"dependencies"',
+       new_string='"overrides": {{"fast-xml-parser": "^5.6.0"}},\\n  "dependencies"')
+     If "overrides" already exists, add the package to it.
+  e) bash("npm install") to apply the override
+  f) bash("npm ls packageName") to verify the override worked
+
+Step 4: Run tests if a test script exists
+  - bash("npm test") or pytest or mvn test
+  - If tests fail, restore_backup and try a different approach
+
+Step 5: ALWAYS call done() with:
+  - summary: what was fixed and how (direct upgrade vs override)
   - changes: list of modified files
   - tests_passed: true/false/null
+  - If nothing could be fixed, still call done() explaining why
+
+IMPORTANT: Do NOT loop forever. If after 3 attempts you cannot fix a vulnerability, call done() \
+and explain what went wrong. It is better to report partial progress than to loop infinitely.
 
 SNYK VULNERABILITY REPORT:
 {snyk_report}
@@ -49,9 +63,9 @@ PROJECT DIRECTORY: {project_dir}
 """
 
 FIX_USER_PROMPT = """\
-Fix the upgradable vulnerabilities now. Call `search_files` with pattern "package.json" to find \
-dependency files, then `read_file` each one, `create_backup`, and `edit_file` to update the \
-vulnerable package versions. Do it now — call the tools.\
+Fix the upgradable vulnerabilities now. Start by calling `search_files` with pattern \
+"package.json" to find all dependency files. Then check if the vulnerable package is a \
+direct or transitive dependency, and fix accordingly. Call the tools now.\
 """
 
 MR_DESCRIPTION_PROMPT = """\

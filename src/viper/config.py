@@ -31,7 +31,7 @@ class AIConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    max_iterations: int = 30
+    max_iterations: int = 15
     timeout_per_tool: int = 300
     blocked_commands: list[str] = Field(
         default_factory=lambda: ["rm -rf /", "sudo", "chmod", "mkfs", "dd if="]
