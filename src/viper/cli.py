@@ -160,7 +160,7 @@ gitlab:
   target_branch: main
 
 ai:
-  model: github_copilot/claude-sonnet-4-6   # any LiteLLM-supported model
+  model: github_copilot/claude-sonnet-4.6   # any LiteLLM-supported model
   temperature: 0.2
   max_tokens: 4096
 

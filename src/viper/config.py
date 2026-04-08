@@ -25,7 +25,7 @@ class GitLabConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    model: str = "github_copilot/claude-sonnet-4-6"
+    model: str = "github_copilot/claude-sonnet-4.6"
     temperature: float = 0.2
     max_tokens: int = 4096
 
