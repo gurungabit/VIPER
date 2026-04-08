@@ -104,17 +104,26 @@ class ViperAgent:
         ]
 
         all_tool_calls: list[ToolCall] = []
+        has_used_tools = False
+        text_only_count = 0
 
         for iteration in range(self.config.agent.max_iterations):
             if self.verbose:
                 console.print(f"\n[cyan]--- Agent iteration {iteration + 1} ---[/cyan]")
+
+            # Force tool use in early iterations to prevent the agent from
+            # just "thinking out loud" without taking action.
+            if not has_used_tools and iteration < 3:
+                tool_choice = "required"
+            else:
+                tool_choice = "auto"
 
             try:
                 response = await litellm.acompletion(
                     model=self.config.ai.model,
                     messages=messages,
                     tools=TOOL_SCHEMAS,
-                    tool_choice="auto",
+                    tool_choice=tool_choice,
                     temperature=self.config.ai.temperature,
                     max_tokens=self.config.ai.max_tokens,
                 )
@@ -127,23 +136,41 @@ class ViperAgent:
             # Append assistant message to conversation
             messages.append(message.model_dump(exclude_none=True))
 
-            # If no tool calls, the agent is done (text response only)
+            # If no tool calls, the agent might be done or just chatting
             if not message.tool_calls:
-                if self.verbose:
-                    console.print(f"[green]Agent finished with text response[/green]")
+                text_only_count += 1
 
-                return AgentResult(
-                    success=True,
-                    summary=message.content or "No changes needed.",
-                    iterations_used=iteration + 1,
-                    tool_calls=all_tool_calls,
-                    changes=[
-                        FileChange(path=c["path"])
-                        for c in self.tool_executor.changes
-                    ],
-                )
+                # Only consider done if the agent has actually used tools
+                # and then stopped, or if it's given up after multiple text turns
+                if has_used_tools or text_only_count >= 2:
+                    if self.verbose:
+                        console.print(f"[green]Agent finished with text response[/green]")
+                    return AgentResult(
+                        success=has_used_tools,
+                        summary=message.content or "No changes needed.",
+                        iterations_used=iteration + 1,
+                        tool_calls=all_tool_calls,
+                        changes=[
+                            FileChange(path=c["path"])
+                            for c in self.tool_executor.changes
+                        ],
+                    )
+
+                # Agent is just thinking — nudge it to use tools
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You must use the available tools to fix the vulnerabilities. "
+                        "Start by calling list_dir to explore the project, then read "
+                        "the dependency files and fix them. Do not just describe what "
+                        "you would do — actually do it using the tools."
+                    ),
+                })
+                continue
 
             # Execute each tool call
+            has_used_tools = True
+            text_only_count = 0
             for tool_call in message.tool_calls:
                 fn = tool_call.function
                 tool_name = fn.name

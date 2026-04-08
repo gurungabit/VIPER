@@ -14,6 +14,50 @@ from rich.console import Console
 console = Console()
 
 
+IGNORED_DIRS = {
+    # JS/Node
+    "node_modules",
+    ".npm",
+    "bower_components",
+    # Python
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".eggs",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    # Java/JVM
+    "target",
+    ".gradle",
+    ".m2",
+    # Build/Dist
+    "build",
+    "dist",
+    "out",
+    ".next",
+    ".nuxt",
+    # Infrastructure
+    ".terraform",
+    ".terragrunt-cache",
+    # VCS/IDE
+    ".git",
+    ".svn",
+    ".hg",
+    ".idea",
+    ".vscode",
+    # OS
+    ".DS_Store",
+    # Containers
+    ".docker",
+    # Coverage/Reports
+    "htmlcov",
+    "coverage",
+    ".nyc_output",
+}
+
+
 class ToolExecutor:
     """Executes tools called by the agent LLM."""
 
@@ -71,6 +115,14 @@ class ToolExecutor:
             raise PermissionError(f"Path '{path}' escapes project directory")
         return resolved
 
+    def _is_ignored(self, path: Path) -> bool:
+        """Check if a path is inside an ignored directory."""
+        try:
+            rel = path.resolve().relative_to(self.project_dir)
+        except ValueError:
+            return False
+        return any(part in IGNORED_DIRS for part in rel.parts)
+
     # --- Tool implementations ---
 
     def _tool_bash(self, command: str, timeout: int | None = None) -> str:
@@ -113,6 +165,8 @@ class ToolExecutor:
     def _tool_read_file(self, path: str) -> str:
         """Read file contents."""
         resolved = self._resolve_path(path)
+        if self._is_ignored(resolved):
+            return f"Error: Path is in an ignored directory (node_modules, .venv, etc.): {path}"
         if not resolved.exists():
             return f"Error: File not found: {path}"
         if not resolved.is_file():
@@ -125,10 +179,11 @@ class ToolExecutor:
 
     def _tool_write_file(self, path: str, content: str) -> str:
         """Write content to a file."""
+        resolved = self._resolve_path(path)
+        if self._is_ignored(resolved):
+            return f"Error: Cannot write to ignored directory (node_modules, .venv, etc.): {path}"
         if self.dry_run:
             return f"[DRY RUN] Would write {len(content)} chars to {path}"
-
-        resolved = self._resolve_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content)
         self._changes.append({"path": path, "action": "modified"})
@@ -137,6 +192,8 @@ class ToolExecutor:
     def _tool_edit_file(self, path: str, old_string: str, new_string: str) -> str:
         """Find and replace in a file."""
         resolved = self._resolve_path(path)
+        if self._is_ignored(resolved):
+            return f"Error: Cannot edit files in ignored directory (node_modules, .venv, etc.): {path}"
         if not resolved.exists():
             return f"Error: File not found: {path}"
 
@@ -164,13 +221,21 @@ class ToolExecutor:
 
         entries = sorted(resolved.iterdir(), key=lambda p: (not p.is_dir(), p.name))
         lines = []
-        for entry in entries[:200]:  # Limit output
+        skipped = 0
+        for entry in entries:
+            if entry.name in IGNORED_DIRS:
+                skipped += 1
+                continue
+            if len(lines) >= 200:
+                break
             rel = entry.relative_to(self.project_dir)
             prefix = "[DIR]  " if entry.is_dir() else "[FILE] "
             lines.append(f"{prefix}{rel}")
 
-        if len(entries) > 200:
-            lines.append(f"... and {len(entries) - 200} more entries")
+        if len(entries) - skipped > 200:
+            lines.append(f"... and {len(entries) - skipped - 200} more entries")
+        if skipped:
+            lines.append(f"({skipped} ignored directories hidden: node_modules, .venv, etc.)")
 
         return "\n".join(lines) if lines else "(empty directory)"
 
@@ -206,10 +271,7 @@ class ToolExecutor:
         matches = []
         for root, dirs, files in os.walk(resolved):
             # Skip common non-project dirs
-            dirs[:] = [d for d in dirs if d not in {
-                "node_modules", ".git", "__pycache__", ".venv", "venv",
-                "target", "build", "dist", ".tox",
-            }]
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
             for name in files:
                 if fnmatch.fnmatch(name, pattern):
                     rel = Path(root, name).relative_to(self.project_dir)
