@@ -1,10 +1,12 @@
 """Tests for VIPER CLI."""
 
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 from typer.testing import CliRunner
 
 from viper.cli import app
+from viper.models.vulnerability import SnykReport
 
 runner = CliRunner()
 
@@ -72,3 +74,21 @@ class TestCLI:
         assert result.exit_code == 0
         assert output.exists()
         assert "Vulnerability Report" in output.read_text()
+
+    def test_auto_no_snyk(self):
+        """auto command fails gracefully when snyk is not available."""
+        result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+        assert result.exit_code == 1
+
+    def test_auto_clean_project(self):
+        """auto command exits cleanly when scan returns no vulns."""
+        empty_report = SnykReport(ok=True, vulnerabilities=[])
+        with patch("viper.cli.SnykParser") as mock_parser:
+            mock_parser.run_scan.return_value = empty_report
+            mock_parser.filter_by_severity.return_value = []
+            mock_parser.deduplicate.return_value = []
+            result = runner.invoke(
+                app, ["auto", "--project-dir", "/tmp"]
+            )
+            assert result.exit_code == 0
+            assert "clean" in result.stdout.lower() or "No vulnerabilities" in result.stdout

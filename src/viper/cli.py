@@ -272,5 +272,116 @@ def mr(
         raise typer.Exit(1)
 
 
+@app.command()
+def auto(
+    project_dir: Optional[Path] = typer.Option(None, "--project-dir", "-p", help="Project directory"),
+    severity: Optional[str] = typer.Option(None, "--severity", "-s", help="Minimum severity"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
+    max_cycles: int = typer.Option(5, "--max-cycles", "-n", help="Max scan-fix-validate cycles"),
+    verbose: bool = typer.Option(False, "--verbose", help="Show agent tool calls"),
+    max_iterations: Optional[int] = typer.Option(None, "--max-iterations", help="Max agent iterations per cycle"),
+) -> None:
+    """Full auto-remediation loop: scan -> fix -> validate, repeat until clean."""
+    try:
+        cfg = _load_config(config)
+        if max_iterations:
+            cfg.agent.max_iterations = max_iterations
+
+        target_dir = project_dir or Path.cwd()
+        sev_threshold = severity or cfg.severity_threshold
+
+        from viper.agent.loop import ViperAgent
+
+        all_changes = []
+        total_fixed = 0
+
+        for cycle in range(1, max_cycles + 1):
+            console.rule(f"[bold cyan]Cycle {cycle}/{max_cycles}[/bold cyan]")
+
+            # --- SCAN ---
+            console.print("\n[bold]Step 1: Scanning for vulnerabilities...[/bold]")
+            try:
+                report = SnykParser.run_scan(
+                    project_dir=target_dir,
+                    snyk_token=cfg.snyk.token or None,
+                    org=cfg.snyk.org or None,
+                    severity_threshold=sev_threshold,
+                )
+            except ViperError as e:
+                console.print(f"[red]Scan error:[/red] {e}")
+                raise typer.Exit(1)
+
+            vulns = SnykParser.filter_by_severity(report, Severity(sev_threshold))
+            vulns = SnykParser.deduplicate(vulns)
+
+            if not vulns:
+                console.print("[green]No vulnerabilities found! Project is clean.[/green]")
+                break
+
+            console.print(f"Found [yellow]{len(vulns)}[/yellow] vulnerabilities")
+            _display_vulns(report, severity)
+
+            # --- FIX ---
+            console.print(f"\n[bold]Step 2: AI agent fixing vulnerabilities...[/bold]")
+            agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
+            result = asyncio.run(agent.run_fix(report))
+
+            if not result.success:
+                console.print(f"[red]Agent failed:[/red] {result.summary}")
+                console.print(f"[yellow]Completed {cycle - 1} successful cycles, {total_fixed} vulnerabilities addressed.[/yellow]")
+                raise typer.Exit(1)
+
+            console.print(f"[green]Agent done:[/green] {result.summary}")
+            for change in result.changes:
+                console.print(f"  Modified: {change.path}")
+            all_changes.extend(result.changes)
+
+            # --- VALIDATE ---
+            console.print(f"\n[bold]Step 3: Re-scanning to validate fixes...[/bold]")
+            try:
+                validation_report = SnykParser.run_scan(
+                    project_dir=target_dir,
+                    snyk_token=cfg.snyk.token or None,
+                    org=cfg.snyk.org or None,
+                    severity_threshold=sev_threshold,
+                )
+            except ViperError as e:
+                console.print(f"[yellow]Validation scan error (fixes may still be valid):[/yellow] {e}")
+                break
+
+            remaining = SnykParser.filter_by_severity(validation_report, Severity(sev_threshold))
+            remaining = SnykParser.deduplicate(remaining)
+            fixed_this_cycle = len(vulns) - len(remaining)
+            total_fixed += max(fixed_this_cycle, 0)
+
+            if not remaining:
+                console.print("[bold green]All vulnerabilities resolved![/bold green]")
+                break
+
+            console.print(
+                f"[yellow]{len(remaining)} vulnerabilities remaining[/yellow] "
+                f"({fixed_this_cycle} fixed this cycle)"
+            )
+
+            if fixed_this_cycle <= 0:
+                console.print("[red]No progress made this cycle — stopping to avoid infinite loop.[/red]")
+                break
+
+        else:
+            console.print(f"\n[yellow]Reached max cycles ({max_cycles}). Some vulnerabilities may remain.[/yellow]")
+
+        # --- SUMMARY ---
+        console.rule("[bold]Summary[/bold]")
+        console.print(f"Cycles completed: {min(cycle, max_cycles)}")
+        console.print(f"Total vulnerabilities addressed: {total_fixed}")
+        console.print(f"Files modified: {len(all_changes)}")
+        for change in all_changes:
+            console.print(f"  - {change.path}")
+
+    except ViperError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
