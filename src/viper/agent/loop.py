@@ -39,12 +39,62 @@ class ViperAgent:
             verbose=verbose,
         )
 
+    @staticmethod
+    def _compact_report(report: SnykReport) -> str:
+        """Build a compact text summary of the Snyk report to fit in context."""
+        from viper.parsers.snyk_parser import SnykParser
+
+        vulns = SnykParser.deduplicate(report.vulnerabilities)
+        # Group by package to compress duplicates
+        groups = SnykParser.group_by_package(vulns)
+
+        lines = [
+            f"Package Manager: {report.package_manager}",
+            f"Total Dependencies: {report.dependency_count}",
+            f"Unique Vulnerabilities: {len(vulns)}",
+            f"Affected Packages: {len(groups)}",
+            "",
+            "VULNERABILITIES BY PACKAGE:",
+            "=" * 60,
+        ]
+
+        for pkg_name, pkg_vulns in sorted(
+            groups.items(),
+            key=lambda x: max(v.severity.rank for v in x[1]),
+            reverse=True,
+        ):
+            version = pkg_vulns[0].version
+            max_sev = max(v.severity.value for v in pkg_vulns)
+            upgradable = any(v.is_upgradable for v in pkg_vulns)
+
+            # Find upgrade target from upgrade_path
+            upgrade_target = None
+            for v in pkg_vulns:
+                for p in v.upgrade_path:
+                    if isinstance(p, str) and "@" in p:
+                        upgrade_target = p.split("@")[-1]
+                        break
+                if upgrade_target:
+                    break
+
+            lines.append(f"\n{pkg_name}@{version}")
+            lines.append(f"  Severity: {max_sev.upper()} | Upgradable: {'Yes' if upgradable else 'No'}")
+            if upgrade_target:
+                lines.append(f"  Suggested upgrade: {pkg_name}@{upgrade_target}")
+
+            for v in pkg_vulns:
+                lines.append(f"  - [{v.severity.value.upper()}] {v.title} ({v.id})")
+                if v.cvss_score:
+                    lines.append(f"    CVSS: {v.cvss_score}")
+
+        return "\n".join(lines)
+
     async def run_fix(self, report: SnykReport) -> AgentResult:
         """Run the agent to fix vulnerabilities in the project."""
-        # Build the snyk report summary for the prompt
-        report_json = report.model_dump_json(indent=2)
+        # Build compact report to fit within LLM context limits
+        compact = self._compact_report(report)
         system_prompt = FIX_SYSTEM_PROMPT.format(
-            snyk_report=report_json,
+            snyk_report=compact,
             project_dir=str(self.project_dir),
         )
 
