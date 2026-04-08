@@ -129,16 +129,17 @@ class ViperAgent:
         ]
 
         all_tool_calls: list[ToolCall] = []
-        has_used_tools = False
+        has_made_edits = False
         text_only_count = 0
 
         for iteration in range(self.config.agent.max_iterations):
             if self.verbose:
                 console.print(f"\n[cyan]--- Agent iteration {iteration + 1} ---[/cyan]")
 
-            # Force tool use in early iterations to prevent the agent from
-            # just "thinking out loud" without taking action.
-            if not has_used_tools and iteration < 3:
+            # Force tool use until the agent has actually edited files or
+            # explicitly called done(). This prevents it from just reading
+            # files and then responding with text.
+            if not has_made_edits and not self.tool_executor.is_done:
                 tool_choice = "required"
             else:
                 tool_choice = "auto"
@@ -161,18 +162,17 @@ class ViperAgent:
             # Append assistant message to conversation
             messages.append(message.model_dump(exclude_none=True))
 
-            # If no tool calls, the agent might be done or just chatting
+            # If no tool calls, check if we should stop or nudge
             if not message.tool_calls:
                 text_only_count += 1
 
-                # Only consider done if the agent has actually used tools
-                # and then stopped, or if it's given up after multiple text turns
-                if has_used_tools or text_only_count >= 2:
+                # Only stop if agent has made edits or called done()
+                if has_made_edits or self.tool_executor.is_done:
                     if self.verbose:
-                        console.print(f"[green]Agent finished with text response[/green]")
+                        console.print(f"[green]Agent finished[/green]")
                     return AgentResult(
-                        success=has_used_tools,
-                        summary=message.content or "No changes needed.",
+                        success=True,
+                        summary=message.content or "Changes applied.",
                         iterations_used=iteration + 1,
                         tool_calls=all_tool_calls,
                         changes=[
@@ -181,20 +181,30 @@ class ViperAgent:
                         ],
                     )
 
-                # Agent is just thinking — nudge it to use tools
+                # Give up after 3 text-only responses with no edits
+                if text_only_count >= 3:
+                    return AgentResult(
+                        success=False,
+                        summary=message.content or "Agent failed to make changes.",
+                        iterations_used=iteration + 1,
+                        tool_calls=all_tool_calls,
+                        changes=[],
+                    )
+
+                # Nudge the agent to actually edit files
                 messages.append({
                     "role": "user",
                     "content": (
-                        "You must use the available tools to fix the vulnerabilities. "
-                        "Start by calling list_dir to explore the project, then read "
-                        "the dependency files and fix them. Do not just describe what "
-                        "you would do — actually do it using the tools."
+                        "You have not edited any files yet. You MUST call `edit_file` to "
+                        "change the vulnerable package versions. For example:\n"
+                        'edit_file(path="package.json", old_string=\'"fast-xml-parser": "5.4.1"\', '
+                        'new_string=\'"fast-xml-parser": "5.6.0"\')\n'
+                        "Do it NOW. Call edit_file on the dependency files."
                     ),
                 })
                 continue
 
             # Execute each tool call
-            has_used_tools = True
             text_only_count = 0
             for tool_call in message.tool_calls:
                 fn = tool_call.function
@@ -220,6 +230,10 @@ class ViperAgent:
                         iteration=iteration,
                     )
                 )
+
+                # Track if agent has made actual file modifications
+                if tool_name in ("edit_file", "write_file") and "Error" not in result:
+                    has_made_edits = True
 
                 # Append tool result to conversation
                 messages.append({
