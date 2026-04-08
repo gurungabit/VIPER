@@ -21,12 +21,9 @@ class SnykParser:
         org: str | None = None,
     ) -> SnykReport:
         """Run `snyk test --json` and return parsed report."""
-        cmd = ["snyk", "test", "--json"]
+        cmd = ["snyk", "test", "--json", "--all-projects"]
         if org:
             cmd.extend(["--org", org])
-        # NOTE: We intentionally do NOT pass --severity-threshold to Snyk.
-        # Some Snyk CLI versions/project types reject it. Instead, we fetch
-        # all vulnerabilities and filter by severity on our side.
 
         # Build env: always inherit parent env so SNYK_TOKEN from shell works.
         # Only override if an explicit token is provided via config.
