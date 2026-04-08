@@ -25,10 +25,13 @@ app = typer.Typer(
 )
 console = Console()
 
-VIPER_BANNER = r"""[bold cyan]
- ╦  ╦╦╔═╗╔═╗╦═╗
- ╚╗╔╝║╠═╝║╣ ╠╦╝
-  ╚╝ ╩╩  ╚═╝╩╚═[/bold cyan] [dim]v{}[/dim]
+VIPER_BANNER = """[bold cyan]
+██╗   ██╗██╗██████╗ ███████╗██████╗
+██║   ██║██║██╔══██╗██╔════╝██╔══██╗
+██║   ██║██║██████╔╝█████╗  ██████╔╝
+╚██╗ ██╔╝██║██╔═══╝ ██╔══╝  ██╔══██╗
+ ╚████╔╝ ██║██║     ███████╗██║  ██║
+  ╚═══╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝[/bold cyan] [dim]v{}[/dim]
 [dim]Vulnerability Identification, Patching & Evaluation Robot[/dim]
 """
 
