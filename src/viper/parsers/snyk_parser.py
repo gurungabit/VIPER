@@ -23,6 +23,7 @@ class SnykParser:
         """Run `snyk test --json` and return parsed report."""
         cmd = [
             "snyk", "test", "--json", "--all-projects",
+            "--detection-depth=10",
             "--exclude=.terraform,.terragrunt-cache,node_modules,.venv,venv,"
             "__pycache__,target,build,dist,.git,.gradle,.m2,.next,.nuxt,"
             "bower_components,.eggs,.tox,.docker,coverage,htmlcov,.nyc_output",
