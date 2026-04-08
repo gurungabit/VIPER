@@ -21,7 +21,12 @@ class SnykParser:
         org: str | None = None,
     ) -> SnykReport:
         """Run `snyk test --json` and return parsed report."""
-        cmd = ["snyk", "test", "--json", "--all-projects"]
+        cmd = [
+            "snyk", "test", "--json", "--all-projects",
+            "--exclude=.terraform,.terragrunt-cache,node_modules,.venv,venv,"
+            "__pycache__,target,build,dist,.git,.gradle,.m2,.next,.nuxt,"
+            "bower_components,.eggs,.tox,.docker,coverage,htmlcov,.nyc_output",
+        ]
         if org:
             cmd.extend(["--org", org])
 
