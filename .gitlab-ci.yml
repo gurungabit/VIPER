@@ -1,0 +1,59 @@
+stages:
+  - scan
+  - fix
+  - mr
+
+variables:
+  PYTHON_VERSION: "3.12"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+.viper-base:
+  image: python:${PYTHON_VERSION}-slim
+  before_script:
+    - pip install uv
+    - uv pip install --system viper
+    - npm install -g snyk || true
+  cache:
+    paths:
+      - .pip-cache/
+
+viper-scan:
+  stage: scan
+  extends: .viper-base
+  script:
+    - viper scan --project-dir . --output json > viper-scan-report.json
+  artifacts:
+    paths:
+      - viper-scan-report.json
+    expire_in: 7 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $VIPER_SCAN == "true"
+
+viper-fix:
+  stage: fix
+  extends: .viper-base
+  script:
+    - viper fix --project-dir . --severity ${VIPER_SEVERITY:-medium} --verbose
+  dependencies:
+    - viper-scan
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: on_success
+    - if: $VIPER_FIX == "true"
+
+viper-mr:
+  stage: mr
+  extends: .viper-base
+  script:
+    - >
+      viper mr
+      --project-dir .
+      --severity ${VIPER_SEVERITY:-medium}
+      --target-branch ${CI_DEFAULT_BRANCH}
+      --verbose
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: on_success
+    - if: $VIPER_MR == "true"

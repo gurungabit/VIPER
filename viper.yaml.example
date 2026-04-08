@@ -1,0 +1,28 @@
+snyk:
+  token: ${SNYK_TOKEN}
+  org: my-org
+
+gitlab:
+  url: https://gitlab.com
+  token: ${VIPER_GITLAB_TOKEN}
+  project_id: "12345"
+  target_branch: main
+
+ai:
+  model: github_copilot/gpt-4o
+  temperature: 0.2
+  max_tokens: 4096
+
+agent:
+  max_iterations: 30
+  timeout_per_tool: 300
+  blocked_commands:
+    - "rm -rf /"
+    - "sudo"
+    - "chmod"
+    - "mkfs"
+    - "dd if="
+
+settings:
+  severity_threshold: medium
+  dry_run: false

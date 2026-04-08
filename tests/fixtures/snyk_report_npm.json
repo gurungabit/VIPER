@@ -1,0 +1,74 @@
+{
+  "ok": false,
+  "vulnerabilities": [
+    {
+      "id": "SNYK-JS-LODASH-1018905",
+      "title": "Prototype Pollution",
+      "description": "lodash before 4.17.21 is vulnerable to Prototype Pollution via the set function.",
+      "severity": "high",
+      "packageName": "lodash",
+      "moduleName": "lodash",
+      "version": "4.17.15",
+      "language": "js",
+      "packageManager": "npm",
+      "identifiers": {
+        "CWE": ["CWE-1321"],
+        "CVE": ["CVE-2021-23337"]
+      },
+      "from": ["my-project@1.0.0", "lodash@4.17.15"],
+      "upgradePath": [false, "lodash@4.17.21"],
+      "isUpgradable": true,
+      "isPatchable": false,
+      "exploitMaturity": "Proof of Concept",
+      "cvssScore": 7.4
+    },
+    {
+      "id": "SNYK-JS-AXIOS-6144788",
+      "title": "Server-Side Request Forgery (SSRF)",
+      "description": "axios before 1.6.0 is vulnerable to SSRF.",
+      "severity": "critical",
+      "packageName": "axios",
+      "moduleName": "axios",
+      "version": "0.21.1",
+      "language": "js",
+      "packageManager": "npm",
+      "identifiers": {
+        "CWE": ["CWE-918"],
+        "CVE": ["CVE-2023-45857"]
+      },
+      "from": ["my-project@1.0.0", "axios@0.21.1"],
+      "upgradePath": [false, "axios@1.6.0"],
+      "isUpgradable": true,
+      "isPatchable": false,
+      "exploitMaturity": "Proof of Concept",
+      "cvssScore": 9.1
+    },
+    {
+      "id": "SNYK-JS-EXPRESS-6474509",
+      "title": "Open Redirect",
+      "description": "express before 4.19.2 is vulnerable to open redirect.",
+      "severity": "medium",
+      "packageName": "express",
+      "moduleName": "express",
+      "version": "4.17.1",
+      "language": "js",
+      "packageManager": "npm",
+      "identifiers": {
+        "CWE": ["CWE-601"],
+        "CVE": ["CVE-2024-29041"]
+      },
+      "from": ["my-project@1.0.0", "express@4.17.1"],
+      "upgradePath": [false, "express@4.19.2"],
+      "isUpgradable": true,
+      "isPatchable": false,
+      "exploitMaturity": "No Known Exploit",
+      "cvssScore": 6.1
+    }
+  ],
+  "dependencyCount": 150,
+  "packageManager": "npm",
+  "summary": "3 vulnerabilities found",
+  "uniqueCount": 3,
+  "org": "test-org",
+  "projectName": "my-project"
+}

@@ -1,0 +1,53 @@
+{
+  "ok": false,
+  "vulnerabilities": [
+    {
+      "id": "SNYK-JAVA-ORGAPACHELOGGINGLOG4J-2314720",
+      "title": "Remote Code Execution (RCE)",
+      "description": "Apache Log4j2 2.0-beta9 through 2.15.0 is vulnerable to RCE via JNDI lookup.",
+      "severity": "critical",
+      "packageName": "org.apache.logging.log4j:log4j-core",
+      "moduleName": "org.apache.logging.log4j:log4j-core",
+      "version": "2.14.1",
+      "language": "java",
+      "packageManager": "maven",
+      "identifiers": {
+        "CWE": ["CWE-502"],
+        "CVE": ["CVE-2021-44228"]
+      },
+      "from": ["my-java-app@1.0.0", "org.apache.logging.log4j:log4j-core@2.14.1"],
+      "upgradePath": [false, "org.apache.logging.log4j:log4j-core@2.17.1"],
+      "isUpgradable": true,
+      "isPatchable": false,
+      "exploitMaturity": "Mature",
+      "cvssScore": 10.0
+    },
+    {
+      "id": "SNYK-JAVA-COMFABORXML-31023",
+      "title": "Denial of Service (DoS)",
+      "description": "jackson-databind before 2.15.0 is vulnerable to DoS.",
+      "severity": "high",
+      "packageName": "com.fasterxml.jackson.core:jackson-databind",
+      "moduleName": "com.fasterxml.jackson.core:jackson-databind",
+      "version": "2.13.0",
+      "language": "java",
+      "packageManager": "maven",
+      "identifiers": {
+        "CWE": ["CWE-400"],
+        "CVE": ["CVE-2022-42003"]
+      },
+      "from": ["my-java-app@1.0.0", "com.fasterxml.jackson.core:jackson-databind@2.13.0"],
+      "upgradePath": [false, "com.fasterxml.jackson.core:jackson-databind@2.15.0"],
+      "isUpgradable": true,
+      "isPatchable": false,
+      "exploitMaturity": "Proof of Concept",
+      "cvssScore": 7.5
+    }
+  ],
+  "dependencyCount": 85,
+  "packageManager": "maven",
+  "summary": "2 vulnerabilities found",
+  "uniqueCount": 2,
+  "org": "test-org",
+  "projectName": "my-java-app"
+}
