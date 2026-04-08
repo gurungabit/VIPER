@@ -6,14 +6,22 @@ import json
 import logging
 from pathlib import Path
 
-import litellm
-from rich.console import Console
 
-# Suppress noisy LiteLLM logs
+# Suppress noisy LiteLLM logs BEFORE importing litellm
+logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
+logging.getLogger("litellm").setLevel(logging.CRITICAL)
+logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
+logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
+logging.getLogger("openai").setLevel(logging.CRITICAL)
+
+import litellm  # noqa: E402
+
 litellm.suppress_debug_info = True
-logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-logging.getLogger("litellm").setLevel(logging.ERROR)
-logging.getLogger("httpx").setLevel(logging.ERROR)
+litellm.set_verbose = False
+
+from rich.console import Console
 
 from viper import ViperAgentError
 from viper.agent.prompts import FIX_SYSTEM_PROMPT, FIX_USER_PROMPT, MR_DESCRIPTION_PROMPT
@@ -52,47 +60,57 @@ class ViperAgent:
         from viper.parsers.snyk_parser import SnykParser
 
         vulns = SnykParser.deduplicate(report.vulnerabilities)
-        # Group by package to compress duplicates
         groups = SnykParser.group_by_package(vulns)
+
+        # Separate upgradable vs non-upgradable
+        upgradable_pkgs = {}
+        non_upgradable_pkgs = {}
+        for pkg_name, pkg_vulns in groups.items():
+            if any(v.is_upgradable for v in pkg_vulns):
+                upgradable_pkgs[pkg_name] = pkg_vulns
+            else:
+                non_upgradable_pkgs[pkg_name] = pkg_vulns
 
         lines = [
             f"Package Manager: {report.package_manager}",
-            f"Total Dependencies: {report.dependency_count}",
-            f"Unique Vulnerabilities: {len(vulns)}",
-            f"Affected Packages: {len(groups)}",
+            f"Total Vulnerabilities: {len(vulns)}",
+            f"Upgradable: {len(upgradable_pkgs)} packages | Non-upgradable: {len(non_upgradable_pkgs)} packages",
             "",
-            "VULNERABILITIES BY PACKAGE:",
-            "=" * 60,
         ]
 
-        for pkg_name, pkg_vulns in sorted(
-            groups.items(),
-            key=lambda x: max(v.severity.rank for v in x[1]),
-            reverse=True,
-        ):
-            version = pkg_vulns[0].version
-            max_sev = max(v.severity.value for v in pkg_vulns)
-            upgradable = any(v.is_upgradable for v in pkg_vulns)
+        # Upgradable packages first — these are actionable
+        if upgradable_pkgs:
+            lines.append("ACTION REQUIRED — UPGRADE THESE PACKAGES:")
+            lines.append("=" * 60)
+            for pkg_name, pkg_vulns in sorted(
+                upgradable_pkgs.items(),
+                key=lambda x: max(v.severity.rank for v in x[1]),
+                reverse=True,
+            ):
+                version = pkg_vulns[0].version
+                max_sev = max(v.severity.value for v in pkg_vulns)
 
-            # Find upgrade target from upgrade_path
-            upgrade_target = None
-            for v in pkg_vulns:
-                for p in v.upgrade_path:
-                    if isinstance(p, str) and "@" in p:
-                        upgrade_target = p.split("@")[-1]
+                # Find upgrade target
+                upgrade_target = None
+                for v in pkg_vulns:
+                    for p in v.upgrade_path:
+                        if isinstance(p, str) and "@" in p:
+                            upgrade_target = p.split("@")[-1]
+                            break
+                    if upgrade_target:
                         break
-                if upgrade_target:
-                    break
 
-            lines.append(f"\n{pkg_name}@{version}")
-            lines.append(f"  Severity: {max_sev.upper()} | Upgradable: {'Yes' if upgradable else 'No'}")
-            if upgrade_target:
-                lines.append(f"  Suggested upgrade: {pkg_name}@{upgrade_target}")
+                fix_str = f" -> UPGRADE TO {upgrade_target}" if upgrade_target else ""
+                lines.append(f"\n  {pkg_name}: {version}{fix_str}  [{max_sev.upper()}]")
+                for v in pkg_vulns:
+                    lines.append(f"    - {v.title}")
 
-            for v in pkg_vulns:
-                lines.append(f"  - [{v.severity.value.upper()}] {v.title} ({v.id})")
-                if v.cvss_score:
-                    lines.append(f"    CVSS: {v.cvss_score}")
+        # Non-upgradable — just list briefly
+        if non_upgradable_pkgs:
+            lines.append(f"\n\nNON-UPGRADABLE ({len(non_upgradable_pkgs)} packages) — skip these:")
+            for pkg_name, pkg_vulns in non_upgradable_pkgs.items():
+                max_sev = max(v.severity.value for v in pkg_vulns)
+                lines.append(f"  {pkg_name}@{pkg_vulns[0].version} [{max_sev.upper()}]")
 
         return "\n".join(lines)
 
