@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import litellm
 from rich.console import Console
+
+# Suppress noisy LiteLLM logs
+litellm.suppress_debug_info = True
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+logging.getLogger("litellm").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
 
 from viper import ViperAgentError
 from viper.agent.prompts import FIX_SYSTEM_PROMPT, FIX_USER_PROMPT, MR_DESCRIPTION_PROMPT
