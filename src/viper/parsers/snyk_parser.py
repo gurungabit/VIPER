@@ -26,7 +26,15 @@ class SnykParser:
         if org:
             cmd.extend(["--org", org])
         if severity_threshold:
-            cmd.extend(["--severity-threshold", severity_threshold])
+            # Snyk only accepts: low, medium, high, critical (lowercase)
+            normalized = severity_threshold.strip().lower()
+            valid = {"low", "medium", "high", "critical"}
+            if normalized not in valid:
+                raise ViperScanError(
+                    f"Invalid severity threshold '{severity_threshold}'. "
+                    f"Must be one of: {', '.join(sorted(valid))}"
+                )
+            cmd.extend(["--severity-threshold", normalized])
 
         # Build env: always inherit parent env so SNYK_TOKEN from shell works.
         # Only override if an explicit token is provided via config.
