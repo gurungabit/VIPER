@@ -129,15 +129,22 @@ class DirectFixer:
                 if new_content and new_content != content:
                     content = new_content
                     applied.append(action)
+                    method = "direct" if action.is_direct else "override"
                     if self.verbose:
                         console.print(
                             f"  [green]{action.package}: "
                             f"{action.current_version} -> {action.fix_version} "
-                            f"in {file_path}[/green]"
+                            f"in {file_path} ({method})[/green]"
                         )
                 else:
+                    if self.verbose:
+                        method = "direct edit" if action.is_direct else "override"
+                        console.print(
+                            f"  [yellow]Skip {action.package}: "
+                            f"could not apply {method} in {file_path}[/yellow]"
+                        )
                     skipped.append(
-                        f"{action.package}: could not find version string in {file_path}"
+                        f"{action.package}: could not apply in {file_path}"
                     )
 
             if content != original and not self.dry_run:
@@ -218,14 +225,22 @@ class DirectFixer:
                     console.print(f"  [yellow]Skip {pkg_name}:[/yellow] {reason}")
                 continue
 
-            # Check if direct dependency in any dep file
+            # Check if DIRECT dependency (in dependencies/devDependencies)
             found_in = []
             for dep_file in dep_files:
                 try:
-                    content = (self.project_dir / dep_file).read_text()
-                    if f'"{pkg_name}"' in content:
-                        found_in.append(dep_file)
-                except OSError:
+                    if dep_file.endswith(".json"):
+                        data = json.loads((self.project_dir / dep_file).read_text())
+                        deps = data.get("dependencies", {})
+                        dev_deps = data.get("devDependencies", {})
+                        if pkg_name in deps or pkg_name in dev_deps:
+                            found_in.append(dep_file)
+                    else:
+                        # requirements.txt, pom.xml — simple text check
+                        content = (self.project_dir / dep_file).read_text()
+                        if pkg_name in content:
+                            found_in.append(dep_file)
+                except (OSError, json.JSONDecodeError):
                     pass
 
             if found_in:
@@ -240,17 +255,40 @@ class DirectFixer:
                         vuln_ids=vuln_ids,
                     ))
             else:
-                # Transitive — add override to root package.json
-                root_pkg = next(
-                    (f for f in dep_files if f == "package.json"),
-                    dep_files[0] if dep_files else "package.json",
-                )
+                # Transitive — add override to the nearest package.json
+                # Try to find which sub-project this vuln belongs to using
+                # the Snyk "from" path (first entry is the project name)
+                target_pkg = None
+                for v in pkg_vulns:
+                    if v.from_path:
+                        # from_path[0] is like "project-name@version"
+                        project_id = v.from_path[0].rsplit("@", 1)[0] if v.from_path[0] else ""
+                        # Find the package.json whose "name" matches
+                        for df in dep_files:
+                            if not df.endswith("package.json"):
+                                continue
+                            try:
+                                d = json.loads((self.project_dir / df).read_text())
+                                if d.get("name", "") == project_id:
+                                    target_pkg = df
+                                    break
+                            except (OSError, json.JSONDecodeError):
+                                pass
+                    if target_pkg:
+                        break
+
+                if not target_pkg:
+                    target_pkg = next(
+                        (f for f in dep_files if f == "package.json"),
+                        dep_files[0] if dep_files else "package.json",
+                    )
+
                 actions.append(FixAction(
                     package=pkg_name,
                     current_version=current,
                     fix_version=fix_version,
                     severity=max_sev,
-                    file_path=root_pkg,
+                    file_path=target_pkg,
                     is_direct=False,
                     vuln_ids=vuln_ids,
                 ))
