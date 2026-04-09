@@ -77,6 +77,7 @@ class ToolExecutor:
             "chmod",
             "mkfs",
             "dd if=",
+            "npm audit",
             "npm audit fix",
             "yarn audit",
             "npm update",

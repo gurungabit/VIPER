@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -324,13 +325,21 @@ class RemediationOrchestrator:
         report: SnykReport,
         feedback: str | None,
     ) -> AgentResult:
+        extra_context = self._collect_unit_context(unit)
         agent = ViperAgent(
             config=self.config,
             project_dir=self.project_dir,
             verbose=self.verbose,
             event_handler=self._handle_agent_event if self.stream_agent else None,
         )
-        return asyncio.run(agent.run_fix_unit(report, unit, feedback=feedback))
+        return asyncio.run(
+            agent.run_fix_unit(
+                report,
+                unit,
+                feedback=feedback,
+                extra_context=extra_context,
+            )
+        )
 
     def _handle_agent_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if event_type == "iteration_start":
@@ -394,6 +403,69 @@ class RemediationOrchestrator:
                 )
 
         return "\n".join(lines)
+
+    def _collect_unit_context(self, unit: FixAction) -> str:
+        """Gather a small deterministic context bundle for the selected unit."""
+        lines = [
+            "The orchestrator already selected the exact target version from Snyk.",
+            "Do not query the registry repeatedly. Only do so if install fails unexpectedly.",
+        ]
+
+        manifest_path = self.project_dir / unit.file_path
+        if manifest_path.exists():
+            try:
+                manifest_text = manifest_path.read_text()
+                lines.append(f"Manifest path: {unit.file_path}")
+                lines.append("Manifest excerpt:")
+                snippet = manifest_text[:3000]
+                lines.append(snippet)
+            except OSError:
+                pass
+
+        if unit.file_path.endswith("package.json"):
+            fixer = DirectFixer(project_dir=self.project_dir, dry_run=True, verbose=False)
+            install_dir = fixer._resolve_install_dir(unit.file_path)
+            relative_install_dir = install_dir.relative_to(self.project_dir)
+            lines.append(f"Install/lockfile refresh directory: {relative_install_dir or Path('.')}")
+
+            ls_output = self._run_command(
+                ["npm", "ls", unit.package],
+                cwd=install_dir,
+                timeout=25,
+            )
+            if ls_output:
+                lines.append("Prechecked `npm ls` output:")
+                lines.append(ls_output)
+
+            registry_output = self._run_command(
+                ["npm", "view", f"{unit.package}@{unit.fix_version}", "version"],
+                cwd=install_dir,
+                timeout=25,
+            )
+            if registry_output:
+                lines.append("Prechecked target registry query:")
+                lines.append(registry_output)
+
+        return "\n".join(lines)
+
+    def _run_command(self, args: list[str], cwd: Path, timeout: int) -> str:
+        """Run a small precheck command and return a short preview."""
+        try:
+            result = subprocess.run(
+                args,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return ""
+
+        output = (result.stdout or result.stderr or "").strip()
+        if not output:
+            return ""
+        compact = " ".join(output.split())
+        return compact[:500] + ("..." if len(compact) > 500 else "")
 
     @staticmethod
     def _unit_matches(selected: FixAction, other: FixAction) -> bool:

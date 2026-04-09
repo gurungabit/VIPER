@@ -205,12 +205,14 @@ ai:
 
 agent:
   max_iterations: 40
+  max_no_edit_iterations: 10
   timeout_per_tool: 300
   blocked_commands:
     - "rm -rf /"
     - "sudo"
     - "chmod"
     - "mkfs"
+    - "npm audit"
     - "npm audit fix"
     - "npm update"
     - "yarn upgrade"

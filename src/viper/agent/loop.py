@@ -244,6 +244,8 @@ class ViperAgent:
         all_tool_calls: list[ToolCall] = []
         has_made_edits = False
         text_only_count = 0
+        no_edit_iterations = 0
+        edit_completion_nudges = 0
 
         for iteration in range(self.config.agent.max_iterations):
             self._emit("iteration_start", iteration=iteration + 1)
@@ -295,6 +297,8 @@ class ViperAgent:
                         ],
                     )
 
+                no_edit_iterations += 1
+
                 # Give up after 3 text-only responses with no edits
                 if text_only_count >= 3:
                     return AgentResult(
@@ -323,6 +327,31 @@ class ViperAgent:
 
             # Execute each tool call
             text_only_count = 0
+            if not has_made_edits:
+                no_edit_iterations += 1
+
+            if (
+                not has_made_edits
+                and no_edit_iterations >= self.config.agent.max_no_edit_iterations
+            ):
+                self._emit(
+                    "nudge",
+                    message=(
+                        "Agent exhausted the pre-edit exploration budget without making a change. "
+                        "Handing control back to the orchestrator."
+                    ),
+                )
+                return AgentResult(
+                    success=False,
+                    summary=(
+                        "Agent exceeded the pre-edit exploration budget without changing files. "
+                        "A deterministic fallback or retry should be attempted."
+                    ),
+                    iterations_used=iteration + 1,
+                    tool_calls=all_tool_calls,
+                    changes=[],
+                )
+
             for tool_call in message.tool_calls:
                 fn = tool_call.function
                 tool_name = fn.name
@@ -357,6 +386,7 @@ class ViperAgent:
                 # Track if agent has made actual file modifications
                 if tool_name in ("edit_file", "write_file") and "Error" not in result:
                     has_made_edits = True
+                    no_edit_iterations = 0
 
                 # Append tool result to conversation
                 messages.append({
@@ -379,6 +409,26 @@ class ViperAgent:
                             for c in done_data.get("changes", self.tool_executor.changes)
                         ],
                     )
+
+            if has_made_edits and not self.tool_executor.is_done:
+                edit_completion_nudges += 1
+                if edit_completion_nudges >= 4:
+                    self._emit(
+                        "nudge",
+                        message=(
+                            "Agent has already edited files. Stop researching and either call done() "
+                            "or perform one final focused verification step."
+                        ),
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You already changed files for this unit. Do not keep researching the registry. "
+                            "Perform at most one final focused verification command, then call done(). "
+                            "The orchestrator will run the authoritative Snyk rescan after you finish."
+                        ),
+                    })
+                    edit_completion_nudges = 0
 
         # Hit max iterations
         self._emit("max_iterations", limit=self.config.agent.max_iterations)
@@ -417,6 +467,7 @@ class ViperAgent:
         report: SnykReport,
         unit: FixAction,
         feedback: str | None = None,
+        extra_context: str | None = None,
     ) -> AgentResult:
         """Run the agent against a single selected remediation unit."""
         related_vulns = []
@@ -448,6 +499,11 @@ class ViperAgent:
             unit_context.append("")
             unit_context.append("RETRY FEEDBACK:")
             unit_context.append(feedback)
+
+        if extra_context:
+            unit_context.append("")
+            unit_context.append("ORCHESTRATOR PRECHECK CONTEXT:")
+            unit_context.append(extra_context)
 
         system_prompt = FIX_SYSTEM_PROMPT.format(
             snyk_report="\n".join(unit_context),
