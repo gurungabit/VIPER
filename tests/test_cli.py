@@ -156,7 +156,7 @@ class TestCLI:
             result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
 
         assert result.exit_code == 0
-        assert "orchestrated unit-by-unit loop" in result.stdout
+        assert "orchestrated batched remediation loop" in result.stdout
         assert "Agent Steps: 40" in result.stdout
 
     def test_auto_can_disable_streaming(self):

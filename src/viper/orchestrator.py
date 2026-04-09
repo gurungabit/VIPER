@@ -27,10 +27,29 @@ console = Console()
 
 
 @dataclass
-class UnitAttempt:
-    """Result for a single remediation unit."""
+class RemediationBatch:
+    """A set of compatible fix units that can be remediated together."""
 
-    unit: FixAction
+    key: str
+    label: str
+    install_root: str
+    actions: list[FixAction] = field(default_factory=list)
+
+    @property
+    def max_severity_rank(self) -> int:
+        return max(Severity(action.severity.lower()).rank for action in self.actions)
+
+    @property
+    def max_severity(self) -> str:
+        highest = max(self.actions, key=lambda action: Severity(action.severity.lower()).rank)
+        return highest.severity
+
+
+@dataclass
+class BatchAttempt:
+    """Result for a single remediation batch."""
+
+    batch: RemediationBatch
     success: bool = False
     fixed_count: int = 0
     attempts_used: int = 0
@@ -52,7 +71,7 @@ class AutoRunResult:
 
 
 class RemediationOrchestrator:
-    """Drive scan -> select unit -> fix -> verify -> retry."""
+    """Drive scan -> select batch -> fix -> verify -> retry."""
 
     def __init__(
         self,
@@ -71,7 +90,7 @@ class RemediationOrchestrator:
         self.use_ai = use_ai
         self.stream_agent = stream_agent
         self.verbose = verbose
-        self.max_attempts_per_unit = 3
+        self.max_attempts_per_batch = 3
 
     def run(self) -> AutoRunResult:
         """Run the remediation loop end-to-end."""
@@ -104,6 +123,7 @@ class RemediationOrchestrator:
                 break
 
             units = self._plan_units(filtered_report)
+            batches = self._plan_batches(units)
             console.print(
                 f"  [bold]Found {len(vulns)} vulnerabilities[/bold] "
                 f"(from {report.dependency_count} dependencies)"
@@ -114,24 +134,29 @@ class RemediationOrchestrator:
             )
             self._display_units(units)
 
-            if not units:
+            if not batches:
                 console.print(
                     "\n[yellow]No safe actionable fix units remain. "
                     "Stopping without broad upgrade guesses.[/yellow]"
                 )
                 break
 
-            selected_unit = units[0]
+            selected_batch = batches[0]
             console.print()
             console.print(
-                f"[bold][2/3] Selected fix unit:[/bold] "
-                f"[{selected_unit.severity.lower()}]{selected_unit.severity}[/{selected_unit.severity.lower()}] "
-                f"{selected_unit.package} {selected_unit.current_version} -> {selected_unit.fix_version} "
-                f"in {selected_unit.file_path} "
-                f"({'direct' if selected_unit.is_direct else 'override'})"
+                f"[bold][2/3] Selected batch:[/bold] "
+                f"[{selected_batch.max_severity.lower()}]{selected_batch.max_severity}[/{selected_batch.max_severity.lower()}] "
+                f"{len(selected_batch.actions)} fix unit(s) "
+                f"in install root [bold]{selected_batch.install_root}[/bold]"
             )
+            for action in selected_batch.actions:
+                console.print(
+                    f"  - {action.package} {action.current_version} -> {action.fix_version} "
+                    f"in {action.file_path} "
+                    f"({'direct' if action.is_direct else 'override'})"
+                )
 
-            attempt = self._remediate_unit(selected_unit, filtered_report)
+            attempt = self._remediate_batch(selected_batch, filtered_report)
             all_changes.extend(attempt.changes)
             total_fixed += max(attempt.fixed_count, 0)
 
@@ -156,7 +181,7 @@ class RemediationOrchestrator:
 
             if attempt.fixed_count <= 0 and not attempt.changes:
                 console.print(
-                    "\n[red]No validated progress on the selected fix unit — stopping.[/red]"
+                    "\n[red]No validated progress on the selected batch — stopping.[/red]"
                 )
                 break
 
@@ -218,6 +243,49 @@ class RemediationOrchestrator:
             reverse=True,
         )
 
+    def _plan_batches(self, units: list[FixAction]) -> list[RemediationBatch]:
+        """Group compatible fix units into safe write batches."""
+        if not units:
+            return []
+
+        fixer = DirectFixer(project_dir=self.project_dir, dry_run=True, verbose=False)
+        by_key: dict[str, RemediationBatch] = {}
+
+        for action in units:
+            key, label, install_root = self._batch_identity(action, fixer)
+            batch = by_key.get(key)
+            if batch is None:
+                batch = RemediationBatch(
+                    key=key,
+                    label=label,
+                    install_root=install_root,
+                )
+                by_key[key] = batch
+            batch.actions.append(action)
+
+        batches = list(by_key.values())
+        for batch in batches:
+            batch.actions.sort(
+                key=lambda action: (
+                    Severity(action.severity.lower()).rank,
+                    1 if action.is_direct else 0,
+                    action.file_path,
+                    action.package,
+                ),
+                reverse=True,
+            )
+
+        return sorted(
+            batches,
+            key=lambda batch: (
+                batch.max_severity_rank,
+                len(batch.actions),
+                batch.install_root,
+                batch.label,
+            ),
+            reverse=True,
+        )
+
     def _display_units(self, units: list[FixAction]) -> None:
         table = Table(title=f"Strategic Fix Units ({len(units)} planned)", show_lines=True)
         table.add_column("Sev", width=8)
@@ -248,29 +316,29 @@ class RemediationOrchestrator:
 
         console.print(table)
 
-    def _remediate_unit(self, unit: FixAction, report: SnykReport) -> UnitAttempt:
+    def _remediate_batch(self, batch: RemediationBatch, report: SnykReport) -> BatchAttempt:
         feedback: str | None = None
-        attempt_result = UnitAttempt(unit=unit)
+        attempt_result = BatchAttempt(batch=batch)
 
-        for attempt_number in range(1, self.max_attempts_per_unit + 1):
+        for attempt_number in range(1, self.max_attempts_per_batch + 1):
             attempt_result.attempts_used = attempt_number
             console.print()
             console.print(
-                f"[bold]Attempt {attempt_number}/{self.max_attempts_per_unit}[/bold] "
-                f"for {unit.package} in {unit.file_path}"
+                f"[bold]Attempt {attempt_number}/{self.max_attempts_per_batch}[/bold] "
+                f"for batch {batch.install_root} ({len(batch.actions)} unit(s))"
             )
 
             ai_result: AgentResult | None = None
             if self.use_ai:
-                ai_result = self._run_agent_for_unit(unit, report, feedback)
+                ai_result = self._run_agent_for_batch(batch, report, feedback)
                 if ai_result.summary:
                     console.print(ai_result.summary)
 
             used_fallback = False
             if (ai_result is None or not ai_result.changes) and self.use_ai:
                 console.print(
-                    "[yellow]Agent made no file changes for this unit. "
-                    "Trying deterministic single-unit remediation.[/yellow]"
+                    "[yellow]Agent made no file changes for this batch. "
+                    "Trying deterministic batched remediation.[/yellow]"
                 )
                 used_fallback = True
 
@@ -279,7 +347,7 @@ class RemediationOrchestrator:
                     project_dir=self.project_dir,
                     dry_run=self.config.dry_run,
                     verbose=True,
-                ).fix_action(unit)
+                ).fix_actions(batch.actions)
                 ai_result = fallback_result
                 if fallback_result.summary:
                     console.print(fallback_result.summary)
@@ -292,40 +360,46 @@ class RemediationOrchestrator:
             attempt_result.validation_report = validation_report
             validation_filtered = self._filter_report(validation_report)
             remaining_units = self._plan_units(validation_filtered)
-            still_present = any(self._unit_matches(unit, other) for other in remaining_units)
+            unresolved_actions = [
+                action for action in batch.actions
+                if any(self._unit_matches(action, other) for other in remaining_units)
+            ]
             current_remaining = len(self._remaining_vulns(validation_report))
             previous_remaining = len(self._remaining_vulns(report))
 
-            if not still_present:
+            if not unresolved_actions:
                 attempt_result.success = True
-                attempt_result.fixed_count = max(previous_remaining - current_remaining, 1)
+                attempt_result.fixed_count = max(
+                    previous_remaining - current_remaining,
+                    len(batch.actions),
+                )
                 attempt_result.summary = (
-                    f"Validated fix for {unit.package} in {unit.file_path} "
+                    f"Validated batch for {batch.install_root} "
                     f"after {attempt_number} attempt(s)."
                 )
                 console.print(f"[green]{attempt_result.summary}[/green]")
                 return attempt_result
 
-            feedback = self._build_retry_feedback(unit, validation_filtered, attempt_number)
+            feedback = self._build_retry_feedback(batch, validation_filtered, attempt_number)
             console.print(
-                f"[yellow]Unit still unresolved after attempt {attempt_number}.[/yellow]"
+                f"[yellow]Batch still has {len(unresolved_actions)} unresolved unit(s) after attempt {attempt_number}.[/yellow]"
             )
             report = validation_filtered
 
         attempt_result.summary = (
-            f"Unable to validate a fix for {unit.package} in {unit.file_path} "
-            f"after {self.max_attempts_per_unit} attempts."
+            f"Unable to validate the batch for {batch.install_root} "
+            f"after {self.max_attempts_per_batch} attempts."
         )
         console.print(f"[red]{attempt_result.summary}[/red]")
         return attempt_result
 
-    def _run_agent_for_unit(
+    def _run_agent_for_batch(
         self,
-        unit: FixAction,
+        batch: RemediationBatch,
         report: SnykReport,
         feedback: str | None,
     ) -> AgentResult:
-        extra_context = self._collect_unit_context(unit)
+        extra_context = self._collect_batch_context(batch)
         agent = ViperAgent(
             config=self.config,
             project_dir=self.project_dir,
@@ -333,9 +407,9 @@ class RemediationOrchestrator:
             event_handler=self._handle_agent_event if self.stream_agent else None,
         )
         return asyncio.run(
-            agent.run_fix_unit(
+            agent.run_fix_batch(
                 report,
-                unit,
+                batch.actions,
                 feedback=feedback,
                 extra_context=extra_context,
             )
@@ -379,18 +453,23 @@ class RemediationOrchestrator:
 
     def _build_retry_feedback(
         self,
-        unit: FixAction,
+        batch: RemediationBatch,
         report: SnykReport,
         attempt_number: int,
     ) -> str:
-        related = [
-            vuln for vuln in SnykParser.deduplicate(report.vulnerabilities)
-            if vuln.package_name == unit.package
-        ]
+        unit_keys = {(action.package, action.file_path) for action in batch.actions}
+        related = []
+        for vuln in SnykParser.deduplicate(report.vulnerabilities):
+            location = vuln.display_target_file or ""
+            if (vuln.package_name, location) in unit_keys or any(
+                vuln.package_name == action.package for action in batch.actions
+            ):
+                related.append(vuln)
+
         lines = [
-            f"The previous attempt did not fully remediate {unit.package} in {unit.file_path}.",
+            f"The previous attempt did not fully remediate the batch for {batch.install_root}.",
             f"Retry number: {attempt_number + 1}.",
-            "Reinspect the owning manifest, workspace root, and dependency tree before editing again.",
+            "Reinspect the owning manifests, shared install root, and dependency tree before editing again.",
         ]
 
         if related:
@@ -404,47 +483,64 @@ class RemediationOrchestrator:
 
         return "\n".join(lines)
 
-    def _collect_unit_context(self, unit: FixAction) -> str:
-        """Gather a small deterministic context bundle for the selected unit."""
+    def _collect_batch_context(self, batch: RemediationBatch) -> str:
+        """Gather a small deterministic context bundle for the selected batch."""
         lines = [
             "The orchestrator already selected the exact target version from Snyk.",
             "Do not query the registry repeatedly. Only do so if install fails unexpectedly.",
         ]
 
-        manifest_path = self.project_dir / unit.file_path
-        if manifest_path.exists():
+        lines.append(f"Selected install root: {batch.install_root}")
+        lines.append(
+            "Batch units: "
+            + ", ".join(
+                f"{action.package}@{action.fix_version} -> {action.file_path}"
+                for action in batch.actions
+            )
+        )
+
+        seen_manifests: set[str] = set()
+        for action in batch.actions:
+            if action.file_path in seen_manifests:
+                continue
+            seen_manifests.add(action.file_path)
+            manifest_path = self.project_dir / action.file_path
+            if not manifest_path.exists():
+                continue
             try:
                 manifest_text = manifest_path.read_text()
-                lines.append(f"Manifest path: {unit.file_path}")
-                lines.append("Manifest excerpt:")
-                snippet = manifest_text[:3000]
-                lines.append(snippet)
             except OSError:
-                pass
+                continue
+            lines.append(f"Manifest path: {action.file_path}")
+            lines.append("Manifest excerpt:")
+            lines.append(manifest_text[:2200])
 
-        if unit.file_path.endswith("package.json"):
-            fixer = DirectFixer(project_dir=self.project_dir, dry_run=True, verbose=False)
-            install_dir = fixer._resolve_install_dir(unit.file_path)
-            relative_install_dir = install_dir.relative_to(self.project_dir)
-            lines.append(f"Install/lockfile refresh directory: {relative_install_dir or Path('.')}")
+        fixer = DirectFixer(project_dir=self.project_dir, dry_run=True, verbose=False)
+        install_dir = None
+        if batch.actions and batch.actions[0].file_path.endswith("package.json"):
+            install_dir = fixer._resolve_install_dir(batch.actions[0].file_path)
+            try:
+                relative_install_dir = install_dir.relative_to(self.project_dir)
+                lines.append(
+                    f"Install/lockfile refresh directory: {relative_install_dir or Path('.')}"
+                )
+            except ValueError:
+                lines.append(f"Install/lockfile refresh directory: {install_dir}")
 
-            ls_output = self._run_command(
-                ["npm", "ls", unit.package],
-                cwd=install_dir,
-                timeout=25,
-            )
-            if ls_output:
-                lines.append("Prechecked `npm ls` output:")
-                lines.append(ls_output)
-
-            registry_output = self._run_command(
-                ["npm", "view", f"{unit.package}@{unit.fix_version}", "version"],
-                cwd=install_dir,
-                timeout=25,
-            )
-            if registry_output:
-                lines.append("Prechecked target registry query:")
-                lines.append(registry_output)
+        if install_dir is not None:
+            seen_packages: set[str] = set()
+            for action in batch.actions:
+                if action.package in seen_packages:
+                    continue
+                seen_packages.add(action.package)
+                ls_output = self._run_command(
+                    ["npm", "ls", action.package],
+                    cwd=install_dir,
+                    timeout=25,
+                )
+                if ls_output:
+                    lines.append(f"Prechecked `npm ls {action.package}` output:")
+                    lines.append(ls_output)
 
         return "\n".join(lines)
 
@@ -473,4 +569,36 @@ class RemediationOrchestrator:
             selected.package == other.package
             and selected.file_path == other.file_path
             and selected.is_direct == other.is_direct
+        )
+
+    def _batch_identity(
+        self,
+        action: FixAction,
+        fixer: DirectFixer,
+    ) -> tuple[str, str, str]:
+        """Return a stable batch key/label/install-root for a fix action."""
+        if action.file_path.endswith("package.json"):
+            install_dir = fixer._resolve_install_dir(action.file_path)
+            try:
+                relative = install_dir.relative_to(self.project_dir)
+                install_root = str(relative) if str(relative) != "." else "."
+            except ValueError:
+                install_root = str(install_dir)
+            return (
+                f"npm:{install_root}",
+                f"npm batch @ {install_root}",
+                install_root,
+            )
+
+        manifest_path = self.project_dir / action.file_path
+        parent = manifest_path.parent
+        try:
+            relative_parent = parent.relative_to(self.project_dir)
+            install_root = str(relative_parent) if str(relative_parent) != "." else "."
+        except ValueError:
+            install_root = str(parent)
+        return (
+            f"manifest:{install_root}",
+            f"manifest batch @ {install_root}",
+            install_root,
         )

@@ -472,7 +472,7 @@ def auto(
         console.print(f"  Severity: [bold]{sev_threshold}[/bold]+")
         console.print(f"  Cycles:   [bold]{max_cycles}[/bold] max")
         if ai_fix:
-            console.print(f"  AI Fix:   [bold]enabled[/bold] (orchestrated unit-by-unit loop)")
+            console.print(f"  AI Fix:   [bold]enabled[/bold] (orchestrated batched remediation loop)")
             console.print(f"  Agent Steps: [bold]{cfg.agent.max_iterations}[/bold] max per cycle")
             console.print(f"  Stream:   [bold]{'enabled' if stream_agent else 'disabled'}[/bold]")
         else:

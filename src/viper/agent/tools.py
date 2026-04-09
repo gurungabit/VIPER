@@ -5,7 +5,6 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -87,7 +86,6 @@ class ToolExecutor:
         ]
         self.timeout = timeout
         self.verbose = verbose
-        self._backups: dict[str, str] = {}  # original_path -> backup_path
         self._changes: list[dict] = []
         self._done = False
         self._done_result: dict | None = None
@@ -311,30 +309,6 @@ class ToolExecutor:
 
         return "\n".join(matches) if matches else "No matches found"
 
-    def _tool_create_backup(self, path: str) -> str:
-        """Create a backup of a file."""
-        resolved = self._resolve_path(path)
-        if not resolved.exists():
-            return f"Error: File not found: {path}"
-
-        backup_path = resolved.with_suffix(resolved.suffix + ".viper.bak")
-        shutil.copy2(resolved, backup_path)
-        self._backups[str(resolved)] = str(backup_path)
-        return f"Backup created: {path} -> {backup_path.name}"
-
-    def _tool_restore_backup(self, path: str) -> str:
-        """Restore a file from backup."""
-        resolved = self._resolve_path(path)
-        backup_path = resolved.with_suffix(resolved.suffix + ".viper.bak")
-
-        if not backup_path.exists():
-            return f"Error: No backup found for {path}"
-
-        shutil.copy2(backup_path, resolved)
-        self._changes = [c for c in self._changes if c["path"] != path]
-        self._changes.append({"path": path, "action": "restored"})
-        return f"Restored {path} from backup"
-
     def _tool_done(
         self,
         summary: str,
@@ -349,11 +323,3 @@ class ToolExecutor:
             "tests_passed": tests_passed,
         }
         return "Task marked as complete."
-
-    def cleanup_backups(self) -> None:
-        """Remove all backup files created during this session."""
-        for backup_path in self._backups.values():
-            try:
-                Path(backup_path).unlink(missing_ok=True)
-            except OSError:
-                pass

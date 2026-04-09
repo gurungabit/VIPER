@@ -27,6 +27,7 @@ from rich.console import Console
 
 from viper import ViperAgentError
 from viper.agent.prompts import (
+    FIX_BATCH_USER_PROMPT,
     FIX_SYSTEM_PROMPT,
     FIX_UNIT_USER_PROMPT,
     FIX_USER_PROMPT,
@@ -514,6 +515,85 @@ class ViperAgent:
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
+        ]
+        return await self._run_messages(messages)
+
+    async def run_fix_batch(
+        self,
+        report: SnykReport,
+        units: list[FixAction],
+        feedback: str | None = None,
+        extra_context: str | None = None,
+    ) -> AgentResult:
+        """Run the agent against a selected batch of remediation units."""
+        if not units:
+            return AgentResult(
+                success=True,
+                summary="No batch actions to apply.",
+                iterations_used=0,
+            )
+
+        unit_context = [
+            "SELECTED REMEDIATION BATCH:",
+            f"- unit_count: {len(units)}",
+        ]
+
+        install_roots = sorted({Path(unit.file_path).parent.as_posix() or "." for unit in units})
+        if install_roots:
+            unit_context.append(f"- manifests_in_batch: {', '.join(sorted({unit.file_path for unit in units}))}")
+            unit_context.append(f"- relative_manifest_dirs: {', '.join(install_roots)}")
+
+        unit_context.append("")
+        unit_context.append("BATCH UNITS:")
+        for index, unit in enumerate(units, start=1):
+            unit_context.extend(
+                [
+                    f"{index}. package: {unit.package}",
+                    f"   manifest: {unit.file_path}",
+                    f"   current_version: {unit.current_version}",
+                    f"   target_version: {unit.fix_version}",
+                    f"   preferred_mode: {'direct dependency bump' if unit.is_direct else 'scoped override'}",
+                    f"   vulnerability_ids: {', '.join(unit.vuln_ids)}",
+                ]
+            )
+
+        related_vulns = []
+        selected_keys = {(unit.package, unit.file_path) for unit in units}
+        for vuln in report.vulnerabilities:
+            location = vuln.display_target_file or ""
+            if (vuln.package_name, location) in selected_keys or any(
+                vuln.package_name == unit.package for unit in units
+            ):
+                related_vulns.append(vuln)
+
+        if related_vulns:
+            unit_context.append("")
+            unit_context.append("RELATED SNYK OCCURRENCES:")
+            for vuln in related_vulns[:20]:
+                location = vuln.display_target_file or vuln.source_project_name or "unknown target"
+                unit_context.append(
+                    f"- [{vuln.severity.value.upper()}] {vuln.id} "
+                    f"{vuln.package_name}@{vuln.version} | target={location}"
+                )
+
+        if feedback:
+            unit_context.append("")
+            unit_context.append("RETRY FEEDBACK:")
+            unit_context.append(feedback)
+
+        if extra_context:
+            unit_context.append("")
+            unit_context.append("ORCHESTRATOR PRECHECK CONTEXT:")
+            unit_context.append(extra_context)
+
+        system_prompt = FIX_SYSTEM_PROMPT.format(
+            snyk_report="\n".join(unit_context),
+            project_dir=str(self.project_dir),
+        )
+
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": FIX_BATCH_USER_PROMPT},
         ]
         return await self._run_messages(messages)
 

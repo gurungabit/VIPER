@@ -52,6 +52,14 @@ Fix only the selected package/file pair below, validate it, and call done() when
 Do not wander across unrelated vulnerabilities. Use tools to inspect the relevant manifest, dependency tree, workspace root, and validation commands before editing.
 """
 
+FIX_BATCH_USER_PROMPT = """\
+You are working on exactly one remediation batch.
+
+Fix only the selected batch below. The batch may contain multiple package/file fixes that share the same install root and should usually be edited together before running one focused install/lockfile refresh.
+
+Do not wander across unrelated vulnerabilities. Prefer applying the full batch in as few manifest edits and install steps as possible, then call done(). The orchestrator will perform the authoritative Snyk rescan after you finish.
+"""
+
 MR_DESCRIPTION_PROMPT = """\
 Generate a professional GitLab merge request description for the following vulnerability fixes.
 

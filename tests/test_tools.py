@@ -68,24 +68,6 @@ class TestToolExecutor:
         result = executor.execute("search_files", {"pattern": "*.json"})
         assert "nested.json" in result
 
-    def test_create_and_restore_backup(self, executor: ToolExecutor):
-        # Create backup
-        result = executor.execute("create_backup", {"path": "test.txt"})
-        assert "Backup created" in result
-
-        # Modify original
-        executor.execute("write_file", {"path": "test.txt", "content": "modified"})
-        assert (executor.project_dir / "test.txt").read_text() == "modified"
-
-        # Restore
-        result = executor.execute("restore_backup", {"path": "test.txt"})
-        assert "Restored" in result
-        assert (executor.project_dir / "test.txt").read_text() == "hello world"
-
-    def test_restore_backup_no_backup(self, executor: ToolExecutor):
-        result = executor.execute("restore_backup", {"path": "test.txt"})
-        assert "Error" in result
-
     def test_bash_simple(self, executor: ToolExecutor):
         result = executor.execute("bash", {"command": "echo hello"})
         assert "hello" in result
@@ -124,10 +106,3 @@ class TestToolExecutor:
         executor.execute("write_file", {"path": "a.txt", "content": "a"})
         executor.execute("write_file", {"path": "b.txt", "content": "b"})
         assert len(executor.changes) == 2
-
-    def test_cleanup_backups(self, executor: ToolExecutor):
-        executor.execute("create_backup", {"path": "test.txt"})
-        backup = executor.project_dir / "test.txt.viper.bak"
-        assert backup.exists()
-        executor.cleanup_backups()
-        assert not backup.exists()

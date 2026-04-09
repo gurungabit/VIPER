@@ -153,40 +153,6 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "create_backup",
-            "description": "Create a backup of a file before modifying it. Always do this before editing dependency files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path to the file to backup",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "restore_backup",
-            "description": "Restore a file from its backup. Use when tests fail after an update.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path to the original file (backup is at path + '.viper.bak')",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "done",
             "description": (
                 "Signal that you have completed the task. Call this when all fixes are applied "
