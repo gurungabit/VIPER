@@ -1,13 +1,13 @@
 """Tests for VIPER CLI."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+from viper import ViperScanError
 from viper.cli import app
-from viper.config import ViperConfig
-from viper.models.result import AgentResult, FileChange
+from viper.orchestrator import AutoRunResult
 from viper.models.vulnerability import SnykReport
 from viper.parsers.snyk_parser import SnykParser
 
@@ -15,29 +15,6 @@ runner = CliRunner()
 
 
 class TestCLI:
-    @staticmethod
-    def _build_vuln_report() -> SnykReport:
-        return SnykParser.parse_json(
-            {
-                "ok": False,
-                "packageManager": "npm",
-                "projectName": "my-project",
-                "dependencyCount": 3,
-                "vulnerabilities": [
-                    {
-                        "id": "SNYK-JS-LODASH-1",
-                        "title": "Prototype Pollution",
-                        "severity": "high",
-                        "packageName": "lodash",
-                        "version": "4.17.15",
-                        "from": ["my-project@1.0.0", "lodash@4.17.15"],
-                        "upgradePath": [False, "lodash@4.17.21"],
-                        "isUpgradable": True,
-                    }
-                ],
-            }
-        )
-
     def test_version(self):
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
@@ -103,141 +80,144 @@ class TestCLI:
 
     def test_auto_no_snyk(self):
         """auto command fails gracefully when snyk is not available."""
-        result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+        with patch(
+            "viper.orchestrator.RemediationOrchestrator.run",
+            side_effect=ViperScanError("boom"),
+        ):
+            result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
         assert result.exit_code == 1
 
     def test_auto_clean_project(self):
-        """auto command exits cleanly when scan returns no vulns."""
-        empty_report = SnykReport(ok=True, vulnerabilities=[])
-        with patch("viper.cli.SnykParser") as mock_parser:
-            mock_parser.run_scan.return_value = empty_report
-            mock_parser.filter_by_severity.return_value = []
-            mock_parser.deduplicate.return_value = []
-            result = runner.invoke(
-                app, ["auto", "--project-dir", "/tmp"]
-            )
-            assert result.exit_code == 0
-            assert "clean" in result.stdout.lower() or "No vulnerabilities" in result.stdout
-
-    def test_auto_ignores_medium_only_findings_by_default(self):
-        """auto should only act on high+ findings unless a lower threshold is requested."""
-        medium_report = SnykParser.parse_json(
-            {
-                "ok": False,
-                "packageManager": "npm",
-                "projectName": "my-project",
-                "dependencyCount": 2,
-                "vulnerabilities": [
-                    {
-                        "id": "SNYK-JS-LODASH-LOWER",
-                        "title": "Prototype Pollution",
-                        "severity": "medium",
-                        "packageName": "lodash",
-                        "version": "4.17.15",
-                        "from": ["my-project@1.0.0", "lodash@4.17.15"],
-                        "upgradePath": [False, "lodash@4.17.21"],
-                        "isUpgradable": True,
-                    }
-                ],
-            }
-        )
-
+        """auto command exits cleanly when the orchestrator finishes without changes."""
         with patch(
-            "viper.cli.SnykParser.run_scan",
-            return_value=medium_report,
-        ), patch("viper.agent.loop.ViperAgent") as mock_agent_cls, patch(
-            "viper.fixer.DirectFixer"
-        ) as mock_fixer_cls:
+            "viper.orchestrator.RemediationOrchestrator.run",
+            return_value=AutoRunResult(
+                cycles_completed=1,
+                total_fixed=0,
+                changes=[],
+                clean=True,
+                duration_seconds=0,
+            ),
+        ):
             result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
 
         assert result.exit_code == 0
-        assert "No vulnerabilities found" in result.stdout
-        mock_agent_cls.assert_not_called()
-        mock_fixer_cls.assert_not_called()
+        assert "Summary" in result.stdout
 
-    def test_auto_prefers_ai_agent_by_default(self):
-        """auto should use the agent first and skip deterministic fallback when AI makes changes."""
-        vuln_report = self._build_vuln_report()
-        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=0)
-        ai_result = AgentResult(
-            success=True,
-            summary="AI fixed lodash via direct bump",
-            changes=[FileChange(path="package.json")],
-        )
+    def test_auto_defaults_to_high_severity_and_streaming(self):
+        """auto should default to high+ severity and live agent streaming."""
+        captured: dict[str, object] = {}
 
-        with patch(
-            "viper.cli.SnykParser.run_scan",
-            side_effect=[vuln_report, clean_report],
-        ), patch("viper.agent.loop.ViperAgent") as mock_agent_cls, patch(
-            "viper.fixer.DirectFixer"
-        ) as mock_fixer_cls:
-            mock_agent = mock_agent_cls.return_value
-            mock_agent.run_fix = AsyncMock(return_value=ai_result)
+        class FakeOrchestrator:
+            def __init__(
+                self,
+                config,
+                project_dir,
+                severity_threshold,
+                max_cycles,
+                use_ai,
+                stream_agent,
+                verbose,
+            ):
+                captured["severity_threshold"] = severity_threshold
+                captured["stream_agent"] = stream_agent
+                captured["max_cycles"] = max_cycles
+                captured["use_ai"] = use_ai
 
+            def run(self):
+                return AutoRunResult(
+                    cycles_completed=1,
+                    total_fixed=0,
+                    changes=[],
+                    clean=True,
+                    duration_seconds=0,
+                )
+
+        with patch("viper.orchestrator.RemediationOrchestrator", FakeOrchestrator):
             result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
 
         assert result.exit_code == 0
-        assert "agent-first remediation loop" in result.stdout
-        assert "AI fixed lodash" in result.stdout
+        assert captured["severity_threshold"] == "high"
+        assert captured["stream_agent"] is True
+        assert captured["max_cycles"] == 10
+        assert captured["use_ai"] is True
+
+    def test_auto_shows_orchestrated_loop_banner(self):
+        with patch(
+            "viper.orchestrator.RemediationOrchestrator.run",
+            return_value=AutoRunResult(
+                cycles_completed=1,
+                total_fixed=1,
+                changes=[],
+                clean=True,
+                duration_seconds=0,
+            ),
+        ):
+            result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+
+        assert result.exit_code == 0
+        assert "orchestrated unit-by-unit loop" in result.stdout
         assert "Agent Steps: 40" in result.stdout
-        mock_fixer_cls.assert_not_called()
 
-    def test_auto_falls_back_when_ai_makes_no_changes(self):
-        """auto should fall back to the deterministic fixer when the AI agent makes no edits."""
-        vuln_report = self._build_vuln_report()
-        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=0)
-        ai_result = AgentResult(
-            success=False,
-            summary="Could not determine the right manifest",
-            changes=[],
-        )
-        fallback_result = AgentResult(
-            success=True,
-            summary="Upgraded 1 package:\n  [HIGH] lodash: 4.17.15 -> 4.17.21",
-            changes=[FileChange(path="package.json")],
-        )
+    def test_auto_can_disable_streaming(self):
+        """auto should allow hiding live agent stream output."""
+        captured: dict[str, object] = {}
 
-        with patch(
-            "viper.cli.SnykParser.run_scan",
-            side_effect=[vuln_report, clean_report],
-        ), patch("viper.agent.loop.ViperAgent") as mock_agent_cls, patch(
-            "viper.fixer.DirectFixer"
-        ) as mock_fixer_cls:
-            mock_agent = mock_agent_cls.return_value
-            mock_agent.run_fix = AsyncMock(return_value=ai_result)
-            mock_fixer = mock_fixer_cls.return_value
-            mock_fixer.fix.return_value = fallback_result
+        class FakeOrchestrator:
+            def __init__(
+                self,
+                config,
+                project_dir,
+                severity_threshold,
+                max_cycles,
+                use_ai,
+                stream_agent,
+                verbose,
+            ):
+                captured["stream_agent"] = stream_agent
 
-            result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+            def run(self):
+                return AutoRunResult(
+                    cycles_completed=1,
+                    total_fixed=0,
+                    changes=[],
+                    clean=True,
+                    duration_seconds=0,
+                )
+
+        with patch("viper.orchestrator.RemediationOrchestrator", FakeOrchestrator):
+            result = runner.invoke(app, ["auto", "--project-dir", "/tmp", "--no-stream-agent"])
 
         assert result.exit_code == 0
-        assert "falling back to deterministic version upgrades" in result.stdout.lower()
-        mock_fixer_cls.assert_called_once()
+        assert captured["stream_agent"] is False
 
     def test_auto_passes_agent_iteration_override(self):
         """auto should honor the per-run agent iteration override."""
-        vuln_report = self._build_vuln_report()
-        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=0)
-
         captured_iterations: list[int] = []
 
-        class FakeAgent:
-            def __init__(self, config: ViperConfig, project_dir: Path, verbose: bool = False):
+        class FakeOrchestrator:
+            def __init__(
+                self,
+                config,
+                project_dir,
+                severity_threshold,
+                max_cycles,
+                use_ai,
+                stream_agent,
+                verbose,
+            ):
                 captured_iterations.append(config.agent.max_iterations)
 
-            async def run_fix(self, report: SnykReport) -> AgentResult:
-                return AgentResult(
-                    success=True,
-                    summary="AI fixed lodash via direct bump",
-                    changes=[FileChange(path="package.json")],
+            def run(self):
+                return AutoRunResult(
+                    cycles_completed=1,
+                    total_fixed=0,
+                    changes=[],
+                    clean=True,
+                    duration_seconds=0,
                 )
 
-        with patch(
-            "viper.cli.SnykParser.run_scan",
-            side_effect=[vuln_report, clean_report],
-        ), patch("viper.agent.loop.ViperAgent", FakeAgent), patch(
-            "viper.fixer.DirectFixer"
-        ) as mock_fixer_cls:
+        with patch("viper.orchestrator.RemediationOrchestrator", FakeOrchestrator):
             result = runner.invoke(
                 app,
                 ["auto", "--project-dir", "/tmp", "--agent-max-iterations", "60"],
@@ -246,4 +226,3 @@ class TestCLI:
         assert result.exit_code == 0
         assert captured_iterations == [60]
         assert "Agent Steps: 60" in result.stdout
-        mock_fixer_cls.assert_not_called()

@@ -40,6 +40,16 @@ Explore the repository with tools and remediate as many safe dependency vulnerab
 Use the REPO HINTS below as hints only, not rigid instructions. Verify the real dependency ownership and installed tree yourself before editing. Prefer explicit manifest bumps or package-manager overrides, then validate the result. Start by inspecting the relevant manifests or dependency tree.\
 """
 
+FIX_UNIT_USER_PROMPT = """\
+You are working on exactly one remediation unit.
+
+Fix only the selected package/file pair below, validate it, and call done() when you either:
+- fully remediate that unit, or
+- determine that the unit cannot be safely fixed.
+
+Do not wander across unrelated vulnerabilities. Use tools to inspect the relevant manifest, dependency tree, workspace root, and validation commands before editing.
+"""
+
 MR_DESCRIPTION_PROMPT = """\
 Generate a professional GitLab merge request description for the following vulnerability fixes.
 

@@ -99,7 +99,16 @@ class DirectFixer:
 
     def fix(self, report: SnykReport) -> AgentResult:
         """Analyze and apply all upgradable fixes."""
-        actions = self._plan_fixes(report)
+        return self.fix_actions(self.plan_fixes(report))
+
+    def plan_fixes(self, report: SnykReport) -> list[FixAction]:
+        """Build a stable list of safe remediation actions from a Snyk report."""
+        return self._plan_fixes(report)
+
+    def fix_actions(self, actions: list[FixAction]) -> AgentResult:
+        """Apply a precomputed set of fix actions."""
+        self._backups = []
+        self._changes = []
 
         if not actions:
             return AgentResult(
@@ -111,8 +120,8 @@ class DirectFixer:
 
         # Group actions by file
         by_file: dict[str, list[FixAction]] = {}
-        for a in actions:
-            by_file.setdefault(a.file_path, []).append(a)
+        for action in actions:
+            by_file.setdefault(action.file_path, []).append(action)
 
         applied: list[FixAction] = []
         refreshed: list[FixAction] = []
@@ -122,11 +131,10 @@ class DirectFixer:
         for file_path, file_actions in by_file.items():
             full_path = self.project_dir / file_path
             if not full_path.exists():
-                for a in file_actions:
-                    skipped.append(f"{a.package}: file {file_path} not found")
+                for action in file_actions:
+                    skipped.append(f"{action.package}: file {file_path} not found")
                 continue
 
-            # Backup
             if not self.dry_run:
                 backup = full_path.with_suffix(full_path.suffix + ".viper.bak")
                 shutil.copy2(full_path, backup)
@@ -169,39 +177,35 @@ class DirectFixer:
                             f"  [yellow]Skip {action.package}: "
                             f"could not apply {method} in {file_path}[/yellow]"
                         )
-                    skipped.append(
-                        f"{action.package}: could not apply in {file_path}"
-                    )
+                    skipped.append(f"{action.package}: could not apply in {file_path}")
 
             if content != original and not self.dry_run:
                 full_path.write_text(content)
                 self._changes.append(FileChange(path=file_path))
 
-        # Run npm install if we changed or refreshed any package.json
         install_ok = True
         if not self.dry_run and install_targets:
             install_ok = self._run_install(install_targets)
 
-        # Build summary
         summary_parts = []
         if applied:
             summary_parts.append(f"Upgraded {len(applied)} packages:")
-            for a in applied:
+            for action in applied:
                 summary_parts.append(
-                    f"  [{a.severity}] {a.package}: {a.current_version} -> {a.fix_version}"
+                    f"  [{action.severity}] {action.package}: {action.current_version} -> {action.fix_version}"
                 )
         if refreshed:
             summary_parts.append(
                 f"\nRefreshed install state for {len(refreshed)} already-pinned packages:"
             )
-            for a in refreshed:
+            for action in refreshed:
                 summary_parts.append(
-                    f"  [{a.severity}] {a.package}: manifest already requests {a.fix_version}"
+                    f"  [{action.severity}] {action.package}: manifest already requests {action.fix_version}"
                 )
         if skipped:
             summary_parts.append(f"\nSkipped {len(skipped)}:")
-            for s in skipped:
-                summary_parts.append(f"  {s}")
+            for skipped_item in skipped:
+                summary_parts.append(f"  {skipped_item}")
         if not install_ok:
             summary_parts.append("\nWARNING: npm install had errors (see above)")
 
@@ -212,6 +216,10 @@ class DirectFixer:
             tests_passed=None,
             iterations_used=1,
         )
+
+    def fix_action(self, action: FixAction) -> AgentResult:
+        """Apply a single remediation action."""
+        return self.fix_actions([action])
 
     def _plan_fixes(self, report: SnykReport) -> list[FixAction]:
         """Build list of fix actions from the Snyk report."""

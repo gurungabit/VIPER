@@ -446,13 +446,18 @@ def auto(
         help="Override the AI agent tool-use iteration limit for this run",
     ),
     verbose: bool = typer.Option(False, "--verbose", help="Show details"),
+    stream_agent: bool = typer.Option(
+        True,
+        "--stream-agent/--no-stream-agent",
+        help="Stream live agent tool activity during remediation",
+    ),
     ai_fix: bool = typer.Option(
         True,
         "--ai-fix/--no-ai-fix",
         help="Use the AI remediation agent first, with deterministic fallback if needed",
     ),
 ) -> None:
-    """Agentic remediation loop: scan -> fix -> validate -> repeat until clean or capped."""
+    """Orchestrated remediation loop: scan -> select fix unit -> fix -> verify -> retry."""
     try:
         cfg = _load_config(config)
         if agent_max_iterations is not None:
@@ -465,213 +470,40 @@ def auto(
         console.print(f"  Severity: [bold]{sev_threshold}[/bold]+")
         console.print(f"  Cycles:   [bold]{max_cycles}[/bold] max")
         if ai_fix:
-            console.print(f"  AI Fix:   [bold]enabled[/bold] (agent-first remediation loop)")
+            console.print(f"  AI Fix:   [bold]enabled[/bold] (orchestrated unit-by-unit loop)")
             console.print(f"  Agent Steps: [bold]{cfg.agent.max_iterations}[/bold] max per cycle")
+            console.print(f"  Stream:   [bold]{'enabled' if stream_agent else 'disabled'}[/bold]")
         else:
             console.print(f"  AI Fix:   [bold]disabled[/bold] (deterministic fixer only)")
         console.print()
 
-        from viper.fixer import DirectFixer
+        from viper.orchestrator import RemediationOrchestrator
 
-        all_changes = []
-        total_fixed = 0
-        start_time = time.time()
-
-        for cycle in range(1, max_cycles + 1):
-            console.rule(
-                f"[bold cyan]Cycle {cycle} of {max_cycles}[/bold cyan]",
-                style="cyan",
-            )
-
-            # ── SCAN ──────────────────────────────────────────────
-            console.print()
-            with Progress(
-                SpinnerColumn("dots"),
-                TextColumn("[bold]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True,
-            ) as progress:
-                progress.add_task(
-                    "[1/3] Scanning all projects with Snyk...", total=None
-                )
-                try:
-                    report = SnykParser.run_scan(
-                        project_dir=target_dir,
-                        snyk_token=cfg.snyk.token or None,
-                        org=cfg.snyk.org or None,
-                    )
-                except ViperError as e:
-                    console.print(f"[red]Scan error:[/red] {e}")
-                    raise typer.Exit(1)
-
-            filtered_report = _filter_report_by_severity(report, Severity(sev_threshold))
-            vulns = SnykParser.deduplicate(filtered_report.vulnerabilities)
-
-            if not vulns:
-                console.print(
-                    Panel(
-                        "[bold green]Project is clean! No vulnerabilities found.[/bold green]",
-                        border_style="green",
-                    )
-                )
-                break
-
-            console.print(
-                f"  [bold]Found {len(vulns)} vulnerabilities[/bold] "
-                f"(from {report.dependency_count} dependencies)\n"
-            )
-            _display_vulns(filtered_report)
-
-            # ── FIX (Phase 1: Agent-first remediation) ────────────
-            console.print()
-            cycle_changes = []
-            used_fallback = False
-
-            if ai_fix:
-                console.print()
-                with Progress(
-                    SpinnerColumn("dots"),
-                    TextColumn("[bold]{task.description}"),
-                    TimeElapsedColumn(),
-                    console=console,
-                    transient=False,
-                ) as progress:
-                    task = progress.add_task(
-                        "[2/3] AI agent exploring repo and applying fixes...",
-                        total=None,
-                    )
-                    ai_result = None
-                    ai_error: Exception | None = None
-
-                    try:
-                        from viper.agent.loop import ViperAgent
-
-                        agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
-                        ai_result = asyncio.run(agent.run_fix(filtered_report))
-                    except Exception as e:
-                        ai_error = e
-
-                    if ai_error is None and ai_result and ai_result.changes:
-                        progress.update(task, description="[green][2/3] AI agent applied changes")
-                    elif ai_error is None:
-                        progress.update(task, description="[yellow][2/3] AI agent made no file changes")
-                    else:
-                        progress.update(task, description="[yellow][2/3] AI agent unavailable; using fallback")
-
-                if ai_error is not None:
-                    console.print(
-                        f"  [yellow]AI agent unavailable:[/yellow] {ai_error}"
-                    )
-                elif ai_result and ai_result.summary:
-                    console.print(f"\n{ai_result.summary}")
-
-                if ai_result and ai_result.changes:
-                    cycle_changes.extend(ai_result.changes)
-                    all_changes.extend(ai_result.changes)
-                else:
-                    console.print(
-                        "\n[yellow]AI agent made no file changes. "
-                        "Falling back to deterministic version upgrades.[/yellow]"
-                    )
-                    used_fallback = True
-            else:
-                used_fallback = True
-
-            # ── FIX (Phase 2: Deterministic fallback when agent cannot act) ──
-            if used_fallback:
-                console.print()
-                console.print("[bold][2/3] Applying deterministic version upgrades...[/bold]")
-                fixer = DirectFixer(project_dir=target_dir, verbose=True)
-                result = fixer.fix(filtered_report)
-                console.print(f"\n{result.summary}")
-                cycle_changes.extend(result.changes)
-                all_changes.extend(result.changes)
-
-            if not cycle_changes:
-                console.print(
-                    "\n[red]No file changes were made this cycle — stopping.[/red]"
-                )
-                break
-
-            # ── VALIDATE ──────────────────────────────────────────
-            console.print()
-            with Progress(
-                SpinnerColumn("dots"),
-                TextColumn("[bold]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True,
-            ) as progress:
-                progress.add_task(
-                    "[3/3] Re-scanning to validate fixes...", total=None
-                )
-                try:
-                    validation_report = SnykParser.run_scan(
-                        project_dir=target_dir,
-                        snyk_token=cfg.snyk.token or None,
-                        org=cfg.snyk.org or None,
-                    )
-                except ViperError as e:
-                    console.print(
-                        f"[yellow]Validation scan error (fixes may still be valid):[/yellow] {e}"
-                    )
-                    break
-
-            remaining = SnykParser.filter_by_severity(
-                validation_report, Severity(sev_threshold)
-            )
-            remaining = SnykParser.deduplicate(remaining)
-            fixed_this_cycle = len(vulns) - len(remaining)
-            total_fixed += max(fixed_this_cycle, 0)
-
-            if not remaining:
-                console.print(
-                    Panel(
-                        "[bold green]All vulnerabilities resolved![/bold green]",
-                        border_style="green",
-                    )
-                )
-                break
-
-            console.print(
-                f"  [yellow]{len(remaining)} vulnerabilities remaining[/yellow] "
-                f"([green]{fixed_this_cycle} fixed[/green] this cycle)"
-            )
-
-            if fixed_this_cycle <= 0:
-                if cycle < max_cycles:
-                    console.print(
-                        "\n[yellow]Validation did not reduce the vulnerability count this cycle. "
-                        "Sending the remaining findings back through the fix loop.[/yellow]"
-                    )
-                    continue
-                console.print(
-                    "\n[red]Reached the loop limit without validated progress.[/red]"
-                )
-                break
-
-        else:
-            console.print(
-                f"\n[yellow]Reached max cycles ({max_cycles}). "
-                f"Some vulnerabilities may remain.[/yellow]"
-            )
+        result = RemediationOrchestrator(
+            config=cfg,
+            project_dir=target_dir,
+            severity_threshold=sev_threshold,
+            max_cycles=max_cycles,
+            use_ai=ai_fix,
+            stream_agent=stream_agent,
+            verbose=verbose,
+        ).run()
 
         # ── SUMMARY ───────────────────────────────────────────
-        elapsed = time.time() - start_time
+        elapsed = result.duration_seconds
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
 
         summary_table = Table(show_header=False, box=None, padding=(0, 2))
         summary_table.add_column(style="bold")
         summary_table.add_column()
-        summary_table.add_row("Cycles completed", str(min(cycle, max_cycles)))
-        summary_table.add_row("Vulnerabilities fixed", str(total_fixed))
-        summary_table.add_row("Files modified", str(len(all_changes)))
+        summary_table.add_row("Cycles completed", str(result.cycles_completed))
+        summary_table.add_row("Vulnerabilities fixed", str(result.total_fixed))
+        summary_table.add_row("Files modified", str(len(result.changes)))
         summary_table.add_row("Duration", f"{minutes}m {seconds}s")
 
-        if all_changes:
-            files = "\n".join(f"  {c.path}" for c in all_changes)
+        if result.changes:
+            files = "\n".join(f"  {c.path}" for c in result.changes)
             summary_table.add_row("Changed files", files)
 
         console.print()

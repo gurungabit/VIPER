@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any, Callable
 
 
 # Suppress noisy LiteLLM logs BEFORE importing litellm
@@ -25,10 +26,16 @@ litellm.set_verbose = False
 from rich.console import Console
 
 from viper import ViperAgentError
-from viper.agent.prompts import FIX_SYSTEM_PROMPT, FIX_USER_PROMPT, MR_DESCRIPTION_PROMPT
+from viper.agent.prompts import (
+    FIX_SYSTEM_PROMPT,
+    FIX_UNIT_USER_PROMPT,
+    FIX_USER_PROMPT,
+    MR_DESCRIPTION_PROMPT,
+)
 from viper.agent.schemas import TOOL_SCHEMAS
 from viper.agent.tools import ToolExecutor
 from viper.config import ViperConfig
+from viper.fixer import FixAction
 from viper.models.result import AgentResult, FileChange, ToolCall
 from viper.models.vulnerability import SnykReport
 
@@ -43,17 +50,65 @@ class ViperAgent:
         config: ViperConfig,
         project_dir: Path,
         verbose: bool = False,
+        event_handler: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.config = config
         self.project_dir = project_dir.resolve()
         self.verbose = verbose
+        self.event_handler = event_handler
         self.tool_executor = ToolExecutor(
             project_dir=self.project_dir,
             dry_run=config.dry_run,
             blocked_commands=config.agent.blocked_commands,
             timeout=config.agent.timeout_per_tool,
-            verbose=verbose,
+            verbose=verbose and event_handler is None,
         )
+
+    def _emit(self, event_type: str, **payload: Any) -> None:
+        if self.event_handler is not None:
+            self.event_handler(event_type, payload)
+            return
+
+        if not self.verbose:
+            return
+
+        if event_type == "iteration_start":
+            console.print(f"\n[cyan]--- Agent iteration {payload['iteration']} ---[/cyan]")
+        elif event_type == "assistant_message" and payload.get("content"):
+            console.print(f"  [blue]Agent:[/blue] {payload['content']}")
+        elif event_type == "tool_call":
+            console.print(f"  [yellow]Tool:[/yellow] {payload['tool_name']}({payload['args_preview']})")
+        elif event_type == "tool_result":
+            console.print(f"  [dim]-> {payload['result_preview']}[/dim]")
+        elif event_type == "completed":
+            console.print("[green]Agent finished[/green]")
+        elif event_type == "nudge":
+            console.print(f"[magenta]{payload['message']}[/magenta]")
+        elif event_type == "max_iterations":
+            console.print(
+                f"[yellow]Agent reached max iterations ({payload['limit']}) without completing.[/yellow]"
+            )
+
+    @staticmethod
+    def _preview_content(content: Any, max_chars: int = 240) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, list):
+            text = " ".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        else:
+            text = str(content)
+        text = " ".join(text.split())
+        return text[:max_chars] + ("..." if len(text) > max_chars else "")
+
+    @staticmethod
+    def _preview_json(data: Any, max_chars: int = 240) -> str:
+        try:
+            text = json.dumps(data, ensure_ascii=True)
+        except TypeError:
+            text = str(data)
+        return text[:max_chars] + ("..." if len(text) > max_chars else "")
 
     def _compact_report(self, report: SnykReport) -> str:
         """Build a compact, strategic summary of the Snyk report to fit in context."""
@@ -184,30 +239,14 @@ class ViperAgent:
 
         return "\n".join(lines)
 
-    async def run_fix(self, report: SnykReport) -> AgentResult:
-        """Run the agent to fix vulnerabilities in the project."""
-        compact = self._compact_report(report)
-        action_plan = self._pre_scan_project(report)
-
-        system_prompt = FIX_SYSTEM_PROMPT.format(
-            snyk_report=compact,
-            project_dir=str(self.project_dir),
-        )
-
-        user_msg = FIX_USER_PROMPT + "\n\nREPO HINTS:\n" + action_plan
-
-        messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
-
+    async def _run_messages(self, messages: list[dict]) -> AgentResult:
+        """Run the low-level tool-use loop for a prepared message list."""
         all_tool_calls: list[ToolCall] = []
         has_made_edits = False
         text_only_count = 0
 
         for iteration in range(self.config.agent.max_iterations):
-            if self.verbose:
-                console.print(f"\n[cyan]--- Agent iteration {iteration + 1} ---[/cyan]")
+            self._emit("iteration_start", iteration=iteration + 1)
 
             # Force tool use until the agent has actually edited files or
             # explicitly called done(). This prevents it from just reading
@@ -231,6 +270,9 @@ class ViperAgent:
 
             choice = response.choices[0]
             message = choice.message
+            content_preview = self._preview_content(message.content)
+            if content_preview:
+                self._emit("assistant_message", content=content_preview)
 
             # Append assistant message to conversation
             messages.append(message.model_dump(exclude_none=True))
@@ -241,8 +283,7 @@ class ViperAgent:
 
                 # Only stop if agent has made edits or called done()
                 if has_made_edits or self.tool_executor.is_done:
-                    if self.verbose:
-                        console.print(f"[green]Agent finished[/green]")
+                    self._emit("completed")
                     return AgentResult(
                         success=True,
                         summary=message.content or "Changes applied.",
@@ -265,16 +306,18 @@ class ViperAgent:
                     )
 
                 # Nudge the agent to actually edit files
+                nudge_message = (
+                    "You have not edited any files yet. You MUST call `edit_file` to "
+                    "fix vulnerabilities. If the vulnerable package is not a direct "
+                    "dependency, add an npm overrides section to package.json to force "
+                    "the transitive dependency to a safe version. If you truly cannot "
+                    "fix it, call `done()` with an explanation. Do NOT just read files "
+                    "— take action NOW."
+                )
+                self._emit("nudge", message="Agent has not edited files yet; forcing an action.")
                 messages.append({
                     "role": "user",
-                    "content": (
-                        "You have not edited any files yet. You MUST call `edit_file` to "
-                        "fix vulnerabilities. If the vulnerable package is not a direct "
-                        "dependency, add an npm overrides section to package.json to force "
-                        "the transitive dependency to a safe version. If you truly cannot "
-                        "fix it, call `done()` with an explanation. Do NOT just read files "
-                        "— take action NOW."
-                    ),
+                    "content": nudge_message,
                 })
                 continue
 
@@ -288,13 +331,19 @@ class ViperAgent:
                 except json.JSONDecodeError:
                     arguments = {}
 
-                if self.verbose:
-                    args_preview = json.dumps(arguments, indent=2)
-                    if len(args_preview) > 300:
-                        args_preview = args_preview[:300] + "..."
-                    console.print(f"  [yellow]Tool:[/yellow] {tool_name}({args_preview})")
+                args_preview = self._preview_json(arguments)
+                self._emit(
+                    "tool_call",
+                    tool_name=tool_name,
+                    args_preview=args_preview,
+                )
 
                 result = self.tool_executor.execute(tool_name, arguments)
+                self._emit(
+                    "tool_result",
+                    tool_name=tool_name,
+                    result_preview=self._preview_content(result, max_chars=280),
+                )
 
                 all_tool_calls.append(
                     ToolCall(
@@ -332,6 +381,7 @@ class ViperAgent:
                     )
 
         # Hit max iterations
+        self._emit("max_iterations", limit=self.config.agent.max_iterations)
         return AgentResult(
             success=False,
             summary=f"Agent reached max iterations ({self.config.agent.max_iterations}) without completing.",
@@ -342,6 +392,74 @@ class ViperAgent:
                 for c in self.tool_executor.changes
             ],
         )
+
+    async def run_fix(self, report: SnykReport) -> AgentResult:
+        """Run the agent to fix vulnerabilities across a full report."""
+        compact = self._compact_report(report)
+        action_plan = self._pre_scan_project(report)
+
+        system_prompt = FIX_SYSTEM_PROMPT.format(
+            snyk_report=compact,
+            project_dir=str(self.project_dir),
+        )
+
+        user_msg = FIX_USER_PROMPT + "\n\nREPO HINTS:\n" + action_plan
+
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+        return await self._run_messages(messages)
+
+    async def run_fix_unit(
+        self,
+        report: SnykReport,
+        unit: FixAction,
+        feedback: str | None = None,
+    ) -> AgentResult:
+        """Run the agent against a single selected remediation unit."""
+        related_vulns = []
+        for vuln in report.vulnerabilities:
+            if vuln.package_name == unit.package:
+                related_vulns.append(vuln)
+
+        unit_context = [
+            "SELECTED REMEDIATION UNIT:",
+            f"- package: {unit.package}",
+            f"- manifest: {unit.file_path}",
+            f"- current_version: {unit.current_version}",
+            f"- target_version: {unit.fix_version}",
+            f"- preferred_mode: {'direct dependency bump' if unit.is_direct else 'scoped override'}",
+            f"- vulnerability_ids: {', '.join(unit.vuln_ids)}",
+        ]
+
+        if related_vulns:
+            unit_context.append("")
+            unit_context.append("RELATED SNYK OCCURRENCES:")
+            for vuln in related_vulns[:12]:
+                location = vuln.display_target_file or vuln.source_project_name or "unknown target"
+                unit_context.append(
+                    f"- [{vuln.severity.value.upper()}] {vuln.id} "
+                    f"{vuln.package_name}@{vuln.version} | target={location}"
+                )
+
+        if feedback:
+            unit_context.append("")
+            unit_context.append("RETRY FEEDBACK:")
+            unit_context.append(feedback)
+
+        system_prompt = FIX_SYSTEM_PROMPT.format(
+            snyk_report="\n".join(unit_context),
+            project_dir=str(self.project_dir),
+        )
+
+        user_msg = FIX_UNIT_USER_PROMPT
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        return await self._run_messages(messages)
 
     async def generate_mr_description(
         self, result: AgentResult, report: SnykReport
