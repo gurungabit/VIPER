@@ -22,6 +22,10 @@ agent:
     - "chmod"
     - "mkfs"
     - "dd if="
+    - "npm audit fix"
+    - "npm update"
+    - "yarn upgrade"
+    - "pnpm up"
 
 settings:
   severity_threshold: medium

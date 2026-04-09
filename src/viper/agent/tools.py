@@ -72,7 +72,17 @@ class ToolExecutor:
         self.project_dir = project_dir.resolve()
         self.dry_run = dry_run
         self.blocked_commands = blocked_commands or [
-            "rm -rf /", "sudo", "chmod", "mkfs", "dd if="
+            "rm -rf /",
+            "sudo",
+            "chmod",
+            "mkfs",
+            "dd if=",
+            "npm audit fix",
+            "yarn audit",
+            "npm update",
+            "yarn upgrade",
+            "yarn up",
+            "pnpm up",
         ]
         self.timeout = timeout
         self.verbose = verbose

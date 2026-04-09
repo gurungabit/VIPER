@@ -1,17 +1,42 @@
 """Tests for VIPER CLI."""
 
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
 from typer.testing import CliRunner
 
 from viper.cli import app
+from viper.models.result import AgentResult, FileChange
 from viper.models.vulnerability import SnykReport
+from viper.parsers.snyk_parser import SnykParser
 
 runner = CliRunner()
 
 
 class TestCLI:
+    @staticmethod
+    def _build_vuln_report() -> SnykReport:
+        return SnykParser.parse_json(
+            {
+                "ok": False,
+                "packageManager": "npm",
+                "projectName": "my-project",
+                "dependencyCount": 3,
+                "vulnerabilities": [
+                    {
+                        "id": "SNYK-JS-LODASH-1",
+                        "title": "Prototype Pollution",
+                        "severity": "high",
+                        "packageName": "lodash",
+                        "version": "4.17.15",
+                        "from": ["my-project@1.0.0", "lodash@4.17.15"],
+                        "upgradePath": [False, "lodash@4.17.21"],
+                        "isUpgradable": True,
+                    }
+                ],
+            }
+        )
+
     def test_version(self):
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
@@ -92,3 +117,61 @@ class TestCLI:
             )
             assert result.exit_code == 0
             assert "clean" in result.stdout.lower() or "No vulnerabilities" in result.stdout
+
+    def test_auto_prefers_ai_agent_by_default(self):
+        """auto should use the agent first and skip deterministic fallback when AI makes changes."""
+        vuln_report = self._build_vuln_report()
+        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=0)
+        ai_result = AgentResult(
+            success=True,
+            summary="AI fixed lodash via direct bump",
+            changes=[FileChange(path="package.json")],
+        )
+
+        with patch(
+            "viper.cli.SnykParser.run_scan",
+            side_effect=[vuln_report, clean_report],
+        ), patch("viper.agent.loop.ViperAgent") as mock_agent_cls, patch(
+            "viper.fixer.DirectFixer"
+        ) as mock_fixer_cls:
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_fix = AsyncMock(return_value=ai_result)
+
+            result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+
+        assert result.exit_code == 0
+        assert "agent-first remediation loop" in result.stdout
+        assert "AI fixed lodash" in result.stdout
+        mock_fixer_cls.assert_not_called()
+
+    def test_auto_falls_back_when_ai_makes_no_changes(self):
+        """auto should fall back to the deterministic fixer when the AI agent makes no edits."""
+        vuln_report = self._build_vuln_report()
+        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=0)
+        ai_result = AgentResult(
+            success=False,
+            summary="Could not determine the right manifest",
+            changes=[],
+        )
+        fallback_result = AgentResult(
+            success=True,
+            summary="Upgraded 1 package:\n  [HIGH] lodash: 4.17.15 -> 4.17.21",
+            changes=[FileChange(path="package.json")],
+        )
+
+        with patch(
+            "viper.cli.SnykParser.run_scan",
+            side_effect=[vuln_report, clean_report],
+        ), patch("viper.agent.loop.ViperAgent") as mock_agent_cls, patch(
+            "viper.fixer.DirectFixer"
+        ) as mock_fixer_cls:
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_fix = AsyncMock(return_value=ai_result)
+            mock_fixer = mock_fixer_cls.return_value
+            mock_fixer.fix.return_value = fallback_result
+
+            result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+
+        assert result.exit_code == 0
+        assert "falling back to deterministic version upgrades" in result.stdout.lower()
+        mock_fixer_cls.assert_called_once()

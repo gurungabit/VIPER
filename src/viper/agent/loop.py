@@ -61,72 +61,71 @@ class ViperAgent:
         from viper.parsers.snyk_parser import SnykParser
 
         vulns = SnykParser.deduplicate(report.vulnerabilities)
-        groups = SnykParser.group_by_package(vulns)
-
-        # Separate upgradable vs non-upgradable
-        upgradable_pkgs = {}
-        non_upgradable_pkgs = {}
-        for pkg_name, pkg_vulns in groups.items():
-            if any(v.is_upgradable for v in pkg_vulns):
-                upgradable_pkgs[pkg_name] = pkg_vulns
-            else:
-                non_upgradable_pkgs[pkg_name] = pkg_vulns
+        upgradable = [v for v in vulns if v.is_upgradable]
+        non_upgradable = [v for v in vulns if not v.is_upgradable]
 
         lines = [
             f"Package Manager: {report.package_manager}",
             f"Total Vulnerabilities: {len(vulns)}",
-            f"Upgradable: {len(upgradable_pkgs)} packages | Non-upgradable: {len(non_upgradable_pkgs)} packages",
+            f"Upgradable Occurrences: {len(upgradable)} | Non-upgradable Occurrences: {len(non_upgradable)}",
             "",
         ]
 
-        # Upgradable packages first — these are actionable
-        if upgradable_pkgs:
-            lines.append("ACTION REQUIRED — UPGRADE THESE PACKAGES:")
+        if upgradable:
+            lines.append("ACTIONABLE VULNERABILITIES:")
             lines.append("=" * 60)
-            for pkg_name, pkg_vulns in sorted(
-                upgradable_pkgs.items(),
-                key=lambda x: max(v.severity.rank for v in x[1]),
+            for vuln in sorted(
+                upgradable,
+                key=lambda item: (
+                    item.severity.rank,
+                    item.source_project_name or item.display_target_file,
+                    item.package_name,
+                ),
                 reverse=True,
             ):
-                version = pkg_vulns[0].version
-                max_sev = max(v.severity.value for v in pkg_vulns)
+                upgrade_target = ViperAgent._matching_upgrade_target(vuln)
+                location = vuln.display_target_file or vuln.source_project_name or "unknown target"
+                lines.append(
+                    f"- [{vuln.severity.value.upper()}] {vuln.package_name}@{vuln.version}"
+                    f" -> {upgrade_target or 'manual'} | target={location} | id={vuln.id}"
+                )
+                lines.append(f"  {vuln.title}")
 
-                # Find upgrade target — must match this package name
-                upgrade_target = None
-                for v in pkg_vulns:
-                    for p in v.upgrade_path:
-                        if isinstance(p, str) and "@" in p:
-                            parts = p.rsplit("@", 1)
-                            if len(parts) == 2 and parts[0] == pkg_name:
-                                upgrade_target = parts[1]
-                                break
-                    if upgrade_target:
-                        break
-
-                fix_str = f" -> UPGRADE TO {upgrade_target}" if upgrade_target else ""
-                lines.append(f"\n  {pkg_name}: {version}{fix_str}  [{max_sev.upper()}]")
-                for v in pkg_vulns:
-                    lines.append(f"    - {v.title}")
-
-        # Non-upgradable — just list briefly
-        if non_upgradable_pkgs:
-            lines.append(f"\n\nNON-UPGRADABLE ({len(non_upgradable_pkgs)} packages) — skip these:")
-            for pkg_name, pkg_vulns in non_upgradable_pkgs.items():
-                max_sev = max(v.severity.value for v in pkg_vulns)
-                lines.append(f"  {pkg_name}@{pkg_vulns[0].version} [{max_sev.upper()}]")
+        if non_upgradable:
+            lines.append(f"\nNON-UPGRADABLE OR MANUAL ({len(non_upgradable)} occurrences):")
+            for vuln in sorted(non_upgradable, key=lambda item: item.severity.rank, reverse=True)[:20]:
+                location = vuln.display_target_file or vuln.source_project_name or "unknown target"
+                lines.append(
+                    f"- [{vuln.severity.value.upper()}] {vuln.package_name}@{vuln.version}"
+                    f" | target={location} | id={vuln.id}"
+                )
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _matching_upgrade_target(vuln) -> str | None:
+        """Return the upgrade target for the vulnerable package itself, if present."""
+        for path_entry in vuln.upgrade_path:
+            if not isinstance(path_entry, str) or "@" not in path_entry:
+                continue
+            dep_name, version = path_entry.rsplit("@", 1)
+            if dep_name == vuln.package_name:
+                return version
+        return None
+
     def _pre_scan_project(self, report: SnykReport) -> str:
-        """Pre-scan project to build concrete action plan for the agent."""
-        import subprocess
+        """Build repository hints without prescribing exact edits."""
         from viper.parsers.snyk_parser import SnykParser
         from viper.agent.tools import IGNORED_DIRS
+        from viper.fixer import DirectFixer
 
         vulns = SnykParser.deduplicate(report.vulnerabilities)
-        groups = SnykParser.group_by_package(vulns)
+        planned_actions = DirectFixer(
+            project_dir=self.project_dir,
+            dry_run=True,
+            verbose=False,
+        )._plan_fixes(report)
 
-        # Find all package.json / requirements.txt / pom.xml files
         dep_files: list[str] = []
         for root, dirs, files in os.walk(self.project_dir):
             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -135,84 +134,50 @@ class ViperAgent:
                     rel = os.path.relpath(os.path.join(root, f), self.project_dir)
                     dep_files.append(rel)
 
-        # Read each dep file and check which vulnerable packages are direct deps
-        direct_fixes = []
-        transitive_fixes = []
+        lines = [f"DEPENDENCY FILES FOUND: {', '.join(dep_files) if dep_files else '(none)'}", ""]
 
-        for pkg_name, pkg_vulns in groups.items():
-            if not any(v.is_upgradable for v in pkg_vulns):
-                continue
-
-            # Find upgrade target
-            upgrade_target = None
-            for v in pkg_vulns:
-                for p in v.upgrade_path:
-                    if isinstance(p, str) and "@" in p:
-                        upgrade_target = p.split("@")[-1]
-                        break
-                if upgrade_target:
-                    break
-
-            current_version = pkg_vulns[0].version
-            max_sev = max(v.severity.value for v in pkg_vulns).upper()
-
-            # Check which dep files contain this package
-            found_in: list[str] = []
-            for dep_file in dep_files:
-                try:
-                    content = (self.project_dir / dep_file).read_text()
-                    if f'"{pkg_name}"' in content:
-                        found_in.append(dep_file)
-                except OSError:
-                    pass
-
-            if found_in:
-                for f in found_in:
-                    direct_fixes.append({
-                        "package": pkg_name,
-                        "current": current_version,
-                        "target": upgrade_target or "latest",
-                        "file": f,
-                        "severity": max_sev,
-                    })
-            else:
-                transitive_fixes.append({
-                    "package": pkg_name,
-                    "current": current_version,
-                    "target": upgrade_target or "latest",
-                    "severity": max_sev,
-                })
-
-        # Build action plan text
-        lines = [f"DEPENDENCY FILES FOUND: {', '.join(dep_files)}", ""]
-
-        if direct_fixes:
-            lines.append("DIRECT DEPENDENCY FIXES (edit the version in the file):")
-            for fix in direct_fixes:
+        if planned_actions:
+            lines.append("REPO HINTS (verify with tools before editing):")
+            for action in planned_actions:
+                method = "direct version bump" if action.is_direct else "override"
                 lines.append(
-                    f'  1. create_backup("{fix["file"]}")'
+                    f"- {action.package}: {action.current_version} -> {action.fix_version}"
+                    f" | file={action.file_path} | suggested={method}"
                 )
-                lines.append(
-                    f'  2. edit_file("{fix["file"]}", '
-                    f'old containing "{fix["package"]}": "{fix["current"]}", '
-                    f'new "{fix["package"]}": "{fix["target"]}")'
-                )
-                lines.append(f'     [{fix["severity"]}] {fix["package"]} {fix["current"]} -> {fix["target"]}')
-                lines.append("")
-
-        if transitive_fixes:
-            root_pkg = next((f for f in dep_files if f == "package.json"), dep_files[0] if dep_files else "package.json")
-            lines.append("TRANSITIVE DEPENDENCY FIXES (add npm overrides):")
-            lines.append(f'  File: {root_pkg}')
-            lines.append(f'  1. create_backup("{root_pkg}")')
-            lines.append(f'  2. read_file("{root_pkg}") to check if "overrides" section exists')
-            lines.append(f'  3. edit_file to add/update overrides:')
-            for fix in transitive_fixes:
-                lines.append(f'     "{fix["package"]}": "^{fix["target"]}"  [{fix["severity"]}]')
             lines.append("")
 
-        if not direct_fixes and not transitive_fixes:
-            lines.append("NO UPGRADABLE VULNERABILITIES FOUND. Call done() immediately.")
+        remaining_manual = []
+        action_keys = {
+            (action.package, action.file_path, action.fix_version)
+            for action in planned_actions
+        }
+        for vuln in vulns:
+            target = self._matching_upgrade_target(vuln)
+            location = vuln.display_target_file or vuln.source_project_name or ""
+            if not vuln.is_upgradable:
+                remaining_manual.append(
+                    f"- {vuln.package_name}@{vuln.version} [{vuln.severity.value.upper()}]"
+                    f" | target={location or 'unknown'} | manual/no direct fix target"
+                )
+                continue
+
+            if location and (vuln.package_name, location, target or "") not in action_keys:
+                remaining_manual.append(
+                    f"- {vuln.package_name}@{vuln.version} [{vuln.severity.value.upper()}]"
+                    f" | target={location} | inspect ownership manually"
+                )
+
+        if remaining_manual:
+            lines.append("ITEMS THAT MAY REQUIRE EXTRA INSPECTION:")
+            lines.extend(remaining_manual[:20])
+            lines.append("")
+
+        lines.append(
+            "Use tools to inspect manifests, lockfiles, workspace layout, and dependency trees before deciding on direct bumps or overrides."
+        )
+        lines.append(
+            "Good starting commands include `npm ls <package>`, `npm ls --all`, `npm test`, and scoped installs run from the correct subproject or workspace root."
+        )
 
         return "\n".join(lines)
 
@@ -226,8 +191,7 @@ class ViperAgent:
             project_dir=str(self.project_dir),
         )
 
-        # The user message now includes the concrete action plan
-        user_msg = FIX_USER_PROMPT + "\n\nACTION PLAN (pre-computed):\n" + action_plan
+        user_msg = FIX_USER_PROMPT + "\n\nREPO HINTS:\n" + action_plan
 
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},

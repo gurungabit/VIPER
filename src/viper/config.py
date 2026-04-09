@@ -34,7 +34,19 @@ class AgentConfig(BaseModel):
     max_iterations: int = 15
     timeout_per_tool: int = 300
     blocked_commands: list[str] = Field(
-        default_factory=lambda: ["rm -rf /", "sudo", "chmod", "mkfs", "dd if="]
+        default_factory=lambda: [
+            "rm -rf /",
+            "sudo",
+            "chmod",
+            "mkfs",
+            "dd if=",
+            "npm audit fix",
+            "yarn audit",
+            "npm update",
+            "yarn upgrade",
+            "yarn up",
+            "pnpm up",
+        ]
     )
 
 

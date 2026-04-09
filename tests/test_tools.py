@@ -94,6 +94,10 @@ class TestToolExecutor:
         result = executor.execute("bash", {"command": "sudo rm -rf /"})
         assert "blocked" in result.lower()
 
+    def test_bash_blocks_audit_fix_shortcuts(self, executor: ToolExecutor):
+        result = executor.execute("bash", {"command": "npm audit fix"})
+        assert "blocked" in result.lower()
+
     def test_done(self, executor: ToolExecutor):
         assert not executor.is_done
         result = executor.execute(

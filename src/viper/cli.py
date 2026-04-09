@@ -183,6 +183,10 @@ agent:
     - "sudo"
     - "chmod"
     - "mkfs"
+    - "npm audit fix"
+    - "npm update"
+    - "yarn upgrade"
+    - "pnpm up"
 
 settings:
   severity_threshold: medium   # low, medium, high, critical
@@ -391,11 +395,15 @@ def auto(
     project_dir: Optional[Path] = typer.Option(None, "--project-dir", "-p", help="Project directory"),
     severity: Optional[str] = typer.Option(None, "--severity", "-s", help="Minimum severity"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
-    max_cycles: int = typer.Option(5, "--max-cycles", "-n", help="Max scan-fix-validate cycles"),
+    max_cycles: int = typer.Option(10, "--max-cycles", "-n", help="Max fix-verify loops"),
     verbose: bool = typer.Option(False, "--verbose", help="Show details"),
-    ai_fix: bool = typer.Option(False, "--ai-fix", help="Use AI agent for code changes after version upgrades"),
+    ai_fix: bool = typer.Option(
+        True,
+        "--ai-fix/--no-ai-fix",
+        help="Use the AI remediation agent first, with deterministic fallback if needed",
+    ),
 ) -> None:
-    """Full auto-remediation loop: scan -> fix -> validate, repeat until clean."""
+    """Agentic remediation loop: scan -> fix -> validate -> repeat until clean or capped."""
     try:
         cfg = _load_config(config)
         target_dir = project_dir or Path.cwd()
@@ -406,7 +414,9 @@ def auto(
         console.print(f"  Severity: [bold]{sev_threshold}[/bold]+")
         console.print(f"  Cycles:   [bold]{max_cycles}[/bold] max")
         if ai_fix:
-            console.print(f"  AI Fix:   [bold]enabled[/bold] (LLM will handle code changes)")
+            console.print(f"  AI Fix:   [bold]enabled[/bold] (agent-first remediation loop)")
+        else:
+            console.print(f"  AI Fix:   [bold]disabled[/bold] (deterministic fixer only)")
         console.print()
 
         from viper.fixer import DirectFixer
@@ -461,16 +471,12 @@ def auto(
             )
             _display_vulns(report, severity)
 
-            # ── FIX (Phase 1: Direct version upgrades) ────────────
+            # ── FIX (Phase 1: Agent-first remediation) ────────────
             console.print()
-            console.print("[bold][2/3] Applying version upgrades...[/bold]")
-            fixer = DirectFixer(project_dir=target_dir, verbose=True)
-            result = fixer.fix(report)
-            console.print(f"\n{result.summary}")
-            all_changes.extend(result.changes)
+            cycle_changes = []
+            used_fallback = False
 
-            # ── FIX (Phase 2: AI agent for code changes, if enabled) ──
-            if ai_fix and result.success:
+            if ai_fix:
                 console.print()
                 with Progress(
                     SpinnerColumn("dots"),
@@ -480,20 +486,61 @@ def auto(
                     transient=False,
                 ) as progress:
                     task = progress.add_task(
-                        "[2/3] AI agent checking for breaking changes...",
+                        "[2/3] AI agent exploring repo and applying fixes...",
                         total=None,
                     )
-                    from viper.agent.loop import ViperAgent
+                    ai_result = None
+                    ai_error: Exception | None = None
 
-                    agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
-                    ai_result = asyncio.run(agent.run_fix(report))
-                    if ai_result.success:
-                        progress.update(task, description="[green][2/3] AI agent complete")
+                    try:
+                        from viper.agent.loop import ViperAgent
+
+                        agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
+                        ai_result = asyncio.run(agent.run_fix(report))
+                    except Exception as e:
+                        ai_error = e
+
+                    if ai_error is None and ai_result and ai_result.changes:
+                        progress.update(task, description="[green][2/3] AI agent applied changes")
+                    elif ai_error is None:
+                        progress.update(task, description="[yellow][2/3] AI agent made no file changes")
                     else:
-                        progress.update(task, description="[yellow][2/3] AI agent done (partial)")
-                if ai_result.changes:
-                    console.print(f"\n  AI changes: {ai_result.summary}")
+                        progress.update(task, description="[yellow][2/3] AI agent unavailable; using fallback")
+
+                if ai_error is not None:
+                    console.print(
+                        f"  [yellow]AI agent unavailable:[/yellow] {ai_error}"
+                    )
+                elif ai_result and ai_result.summary:
+                    console.print(f"\n{ai_result.summary}")
+
+                if ai_result and ai_result.changes:
+                    cycle_changes.extend(ai_result.changes)
                     all_changes.extend(ai_result.changes)
+                else:
+                    console.print(
+                        "\n[yellow]AI agent made no file changes. "
+                        "Falling back to deterministic version upgrades.[/yellow]"
+                    )
+                    used_fallback = True
+            else:
+                used_fallback = True
+
+            # ── FIX (Phase 2: Deterministic fallback when agent cannot act) ──
+            if used_fallback:
+                console.print()
+                console.print("[bold][2/3] Applying deterministic version upgrades...[/bold]")
+                fixer = DirectFixer(project_dir=target_dir, verbose=True)
+                result = fixer.fix(report)
+                console.print(f"\n{result.summary}")
+                cycle_changes.extend(result.changes)
+                all_changes.extend(result.changes)
+
+            if not cycle_changes:
+                console.print(
+                    "\n[red]No file changes were made this cycle — stopping.[/red]"
+                )
+                break
 
             # ── VALIDATE ──────────────────────────────────────────
             console.print()
@@ -541,8 +588,14 @@ def auto(
             )
 
             if fixed_this_cycle <= 0:
+                if cycle < max_cycles:
+                    console.print(
+                        "\n[yellow]Validation did not reduce the vulnerability count this cycle. "
+                        "Sending the remaining findings back through the fix loop.[/yellow]"
+                    )
+                    continue
                 console.print(
-                    "\n[red]No progress made this cycle — stopping to avoid infinite loop.[/red]"
+                    "\n[red]Reached the loop limit without validated progress.[/red]"
                 )
                 break
 
