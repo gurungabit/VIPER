@@ -19,15 +19,16 @@ class SnykParser:
         project_dir: Path,
         snyk_token: str | None = None,
         org: str | None = None,
+        severity_threshold: str | None = "medium",
     ) -> SnykReport:
         """Run `snyk test --json` and return parsed report."""
         cmd = [
-            "snyk", "test", "--json", "--all-projects",
-            "--detection-depth=4",
-            "--exclude=.terraform,.terragrunt-cache,node_modules,.venv,venv,"
-            "__pycache__,target,build,dist,.git,.gradle,.m2,.next,.nuxt,"
-            "bower_components,.eggs,.tox,.docker,coverage,htmlcov,.nyc_output",
+            "snyk", "test", "--json", "--dev",
+            "--all-projects", "--detection-depth=4",
+            "--exclude=node_modules,.venv,venv,__pycache__,.git,.tox,.eggs,.terraform,vendor",
         ]
+        if severity_threshold:
+            cmd.extend(["--severity-threshold", severity_threshold])
         if org:
             cmd.extend(["--org", org])
 

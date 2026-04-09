@@ -46,9 +46,10 @@ def _load_config(config_path: Path | None) -> ViperConfig:
 
 
 def _run_scan_with_progress(
-    project_dir: Path, config: ViperConfig
+    project_dir: Path, config: ViperConfig, severity: str | None = None
 ) -> SnykReport:
     """Run Snyk scan with a spinner."""
+    sev = severity or config.severity_threshold
     with Progress(
         SpinnerColumn("dots"),
         TextColumn("[bold]{task.description}"),
@@ -56,11 +57,12 @@ def _run_scan_with_progress(
         console=console,
         transient=True,
     ) as progress:
-        progress.add_task("Scanning all projects with Snyk (--all-projects)...", total=None)
+        progress.add_task(f"Scanning all projects with Snyk (--dev --severity-threshold={sev})...", total=None)
         return SnykParser.run_scan(
             project_dir=project_dir,
             snyk_token=config.snyk.token or None,
             org=config.snyk.org or None,
+            severity_threshold=sev,
         )
 
 
@@ -214,7 +216,7 @@ def scan(
             report = SnykParser.parse_file(report_file)
         else:
             target = project_dir or Path.cwd()
-            report = _run_scan_with_progress(target, cfg)
+            report = _run_scan_with_progress(target, cfg, severity)
 
         if output == "json":
             console.print_json(report.model_dump_json(indent=2))
@@ -249,7 +251,7 @@ def fix(
         if report_file:
             report = SnykParser.parse_file(report_file)
         else:
-            report = _run_scan_with_progress(target_dir, cfg)
+            report = _run_scan_with_progress(target_dir, cfg, severity)
 
         if report.ok and not report.vulnerabilities:
             console.print("[green]No vulnerabilities found![/green]")
@@ -305,7 +307,7 @@ def report(
             snyk_report = SnykParser.parse_file(report_file)
         else:
             target = project_dir or Path.cwd()
-            snyk_report = _run_scan_with_progress(target, cfg)
+            snyk_report = _run_scan_with_progress(target, cfg, severity)
 
         from viper.report_generator import ReportGenerator
 
@@ -349,7 +351,7 @@ def mr(
         if report_file:
             report = SnykParser.parse_file(report_file)
         else:
-            report = _run_scan_with_progress(target_dir, cfg)
+            report = _run_scan_with_progress(target_dir, cfg, severity)
 
         if report.ok and not report.vulnerabilities:
             console.print("[green]No vulnerabilities found![/green]")
@@ -448,6 +450,7 @@ def auto(
                         project_dir=target_dir,
                         snyk_token=cfg.snyk.token or None,
                         org=cfg.snyk.org or None,
+                        severity_threshold=sev_threshold,
                     )
                 except ViperError as e:
                     console.print(f"[red]Scan error:[/red] {e}")
