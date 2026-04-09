@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 
@@ -114,18 +115,121 @@ class ViperAgent:
 
         return "\n".join(lines)
 
+    def _pre_scan_project(self, report: SnykReport) -> str:
+        """Pre-scan project to build concrete action plan for the agent."""
+        import subprocess
+        from viper.parsers.snyk_parser import SnykParser
+        from viper.agent.tools import IGNORED_DIRS
+
+        vulns = SnykParser.deduplicate(report.vulnerabilities)
+        groups = SnykParser.group_by_package(vulns)
+
+        # Find all package.json / requirements.txt / pom.xml files
+        dep_files: list[str] = []
+        for root, dirs, files in os.walk(self.project_dir):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            for f in files:
+                if f in ("package.json", "requirements.txt", "pyproject.toml", "pom.xml"):
+                    rel = os.path.relpath(os.path.join(root, f), self.project_dir)
+                    dep_files.append(rel)
+
+        # Read each dep file and check which vulnerable packages are direct deps
+        direct_fixes = []
+        transitive_fixes = []
+
+        for pkg_name, pkg_vulns in groups.items():
+            if not any(v.is_upgradable for v in pkg_vulns):
+                continue
+
+            # Find upgrade target
+            upgrade_target = None
+            for v in pkg_vulns:
+                for p in v.upgrade_path:
+                    if isinstance(p, str) and "@" in p:
+                        upgrade_target = p.split("@")[-1]
+                        break
+                if upgrade_target:
+                    break
+
+            current_version = pkg_vulns[0].version
+            max_sev = max(v.severity.value for v in pkg_vulns).upper()
+
+            # Check which dep files contain this package
+            found_in: list[str] = []
+            for dep_file in dep_files:
+                try:
+                    content = (self.project_dir / dep_file).read_text()
+                    if f'"{pkg_name}"' in content:
+                        found_in.append(dep_file)
+                except OSError:
+                    pass
+
+            if found_in:
+                for f in found_in:
+                    direct_fixes.append({
+                        "package": pkg_name,
+                        "current": current_version,
+                        "target": upgrade_target or "latest",
+                        "file": f,
+                        "severity": max_sev,
+                    })
+            else:
+                transitive_fixes.append({
+                    "package": pkg_name,
+                    "current": current_version,
+                    "target": upgrade_target or "latest",
+                    "severity": max_sev,
+                })
+
+        # Build action plan text
+        lines = [f"DEPENDENCY FILES FOUND: {', '.join(dep_files)}", ""]
+
+        if direct_fixes:
+            lines.append("DIRECT DEPENDENCY FIXES (edit the version in the file):")
+            for fix in direct_fixes:
+                lines.append(
+                    f'  1. create_backup("{fix["file"]}")'
+                )
+                lines.append(
+                    f'  2. edit_file("{fix["file"]}", '
+                    f'old containing "{fix["package"]}": "{fix["current"]}", '
+                    f'new "{fix["package"]}": "{fix["target"]}")'
+                )
+                lines.append(f'     [{fix["severity"]}] {fix["package"]} {fix["current"]} -> {fix["target"]}')
+                lines.append("")
+
+        if transitive_fixes:
+            root_pkg = next((f for f in dep_files if f == "package.json"), dep_files[0] if dep_files else "package.json")
+            lines.append("TRANSITIVE DEPENDENCY FIXES (add npm overrides):")
+            lines.append(f'  File: {root_pkg}')
+            lines.append(f'  1. create_backup("{root_pkg}")')
+            lines.append(f'  2. read_file("{root_pkg}") to check if "overrides" section exists')
+            lines.append(f'  3. edit_file to add/update overrides:')
+            for fix in transitive_fixes:
+                lines.append(f'     "{fix["package"]}": "^{fix["target"]}"  [{fix["severity"]}]')
+            lines.append("")
+
+        if not direct_fixes and not transitive_fixes:
+            lines.append("NO UPGRADABLE VULNERABILITIES FOUND. Call done() immediately.")
+
+        return "\n".join(lines)
+
     async def run_fix(self, report: SnykReport) -> AgentResult:
         """Run the agent to fix vulnerabilities in the project."""
-        # Build compact report to fit within LLM context limits
         compact = self._compact_report(report)
+        action_plan = self._pre_scan_project(report)
+
         system_prompt = FIX_SYSTEM_PROMPT.format(
             snyk_report=compact,
             project_dir=str(self.project_dir),
         )
 
+        # The user message now includes the concrete action plan
+        user_msg = FIX_USER_PROMPT + "\n\nACTION PLAN (pre-computed):\n" + action_plan
+
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": FIX_USER_PROMPT},
+            {"role": "user", "content": user_msg},
         ]
 
         all_tool_calls: list[ToolCall] = []

@@ -63,9 +63,9 @@ PROJECT DIRECTORY: {project_dir}
 """
 
 FIX_USER_PROMPT = """\
-Fix the upgradable vulnerabilities now. Start by calling `search_files` with pattern \
-"package.json" to find all dependency files. Then check if the vulnerable package is a \
-direct or transitive dependency, and fix accordingly. Call the tools now.\
+Execute the ACTION PLAN below. The plan tells you exactly which files to edit and what \
+to change. Follow the numbered steps: create_backup, then edit_file, then npm install. \
+Do NOT explore or search — the plan already has the file paths and versions. Start now.\
 """
 
 MR_DESCRIPTION_PROMPT = """\
