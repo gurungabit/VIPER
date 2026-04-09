@@ -121,14 +121,6 @@ class DirectFixer:
             original = content
 
             for action in file_actions:
-                if self.verbose:
-                    console.print(
-                        f"  [{'dim' if self.dry_run else 'green'}]"
-                        f"{'[DRY RUN] ' if self.dry_run else ''}"
-                        f"{action.package}: {action.current_version} -> {action.fix_version} "
-                        f"in {file_path}[/]"
-                    )
-
                 if action.is_direct:
                     new_content = self._apply_direct_fix(content, action, file_path)
                 else:
@@ -137,6 +129,12 @@ class DirectFixer:
                 if new_content and new_content != content:
                     content = new_content
                     applied.append(action)
+                    if self.verbose:
+                        console.print(
+                            f"  [green]{action.package}: "
+                            f"{action.current_version} -> {action.fix_version} "
+                            f"in {file_path}[/green]"
+                        )
                 else:
                     skipped.append(
                         f"{action.package}: could not find version string in {file_path}"
@@ -192,13 +190,17 @@ class DirectFixer:
                 continue
             seen_packages.add(pkg_name)
 
-            # Find fix version
+            # Find fix version — must match the vulnerable package name
             fix_version = None
             for v in pkg_vulns:
                 for p in v.upgrade_path:
                     if isinstance(p, str) and "@" in p:
-                        fix_version = p.split("@")[-1]
-                        break
+                        # upgrade_path entries are like "package@version"
+                        # Only use it if it's for THIS package
+                        parts = p.rsplit("@", 1)
+                        if len(parts) == 2 and parts[0] == pkg_name:
+                            fix_version = parts[1]
+                            break
                 if fix_version:
                     break
 

@@ -91,13 +91,15 @@ class ViperAgent:
                 version = pkg_vulns[0].version
                 max_sev = max(v.severity.value for v in pkg_vulns)
 
-                # Find upgrade target
+                # Find upgrade target — must match this package name
                 upgrade_target = None
                 for v in pkg_vulns:
                     for p in v.upgrade_path:
                         if isinstance(p, str) and "@" in p:
-                            upgrade_target = p.split("@")[-1]
-                            break
+                            parts = p.rsplit("@", 1)
+                            if len(parts) == 2 and parts[0] == pkg_name:
+                                upgrade_target = parts[1]
+                                break
                     if upgrade_target:
                         break
 

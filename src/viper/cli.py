@@ -94,13 +94,15 @@ def _display_vulns(report: SnykReport, severity_filter: str | None = None) -> in
 
     for v in sorted(vulns, key=lambda x: x.severity.rank, reverse=True):
         color = severity_colors.get(v.severity, "white")
-        # Extract fix version from upgrade_path
+        # Extract fix version — only if it matches this package name
         fix_ver = ""
         if v.is_upgradable:
             for p in v.upgrade_path:
                 if isinstance(p, str) and "@" in p:
-                    fix_ver = p.split("@")[-1]
-                    break
+                    parts = p.rsplit("@", 1)
+                    if len(parts) == 2 and parts[0] == v.package_name:
+                        fix_ver = parts[1]
+                        break
         fix_display = f"[green]{fix_ver}[/green]" if fix_ver else "[red]N/A[/red]"
 
         table.add_row(
