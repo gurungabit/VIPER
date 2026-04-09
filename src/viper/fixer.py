@@ -94,7 +94,6 @@ class DirectFixer:
         self.project_dir = project_dir.resolve()
         self.dry_run = dry_run
         self.verbose = verbose
-        self._backups: list[Path] = []
         self._changes: list[FileChange] = []
 
     def fix(self, report: SnykReport) -> AgentResult:
@@ -107,7 +106,6 @@ class DirectFixer:
 
     def fix_actions(self, actions: list[FixAction]) -> AgentResult:
         """Apply a precomputed set of fix actions."""
-        self._backups = []
         self._changes = []
 
         if not actions:
@@ -126,7 +124,7 @@ class DirectFixer:
         applied: list[FixAction] = []
         refreshed: list[FixAction] = []
         skipped: list[str] = []
-        install_targets: set[str] = set()
+        install_actions: list[FixAction] = []
 
         for file_path, file_actions in by_file.items():
             full_path = self.project_dir / file_path
@@ -134,11 +132,6 @@ class DirectFixer:
                 for action in file_actions:
                     skipped.append(f"{action.package}: file {file_path} not found")
                 continue
-
-            if not self.dry_run:
-                backup = full_path.with_suffix(full_path.suffix + ".viper.bak")
-                shutil.copy2(full_path, backup)
-                self._backups.append(backup)
 
             content = full_path.read_text()
             original = content
@@ -152,7 +145,7 @@ class DirectFixer:
                 if new_content and new_content != content:
                     content = new_content
                     applied.append(action)
-                    install_targets.add(file_path)
+                    install_actions.append(action)
                     method = "direct" if action.is_direct else "override"
                     if self.verbose:
                         console.print(
@@ -162,7 +155,7 @@ class DirectFixer:
                         )
                 elif self._action_already_present(content, action, file_path):
                     refreshed.append(action)
-                    install_targets.add(file_path)
+                    install_actions.append(action)
                     if self.verbose:
                         method = "direct" if action.is_direct else "override"
                         console.print(
@@ -184,8 +177,8 @@ class DirectFixer:
                 self._changes.append(FileChange(path=file_path))
 
         install_ok = True
-        if not self.dry_run and install_targets:
-            install_ok = self._run_install(install_targets)
+        if not self.dry_run and install_actions:
+            install_ok = self._run_install(install_actions)
 
         summary_parts = []
         if applied:
@@ -368,36 +361,60 @@ class DirectFixer:
             return None
 
         overrides = data.get("overrides", {})
-        if isinstance(overrides.get(action.package), str) and self._version_matches_spec(
+        if isinstance(overrides.get(action.package), str) and self._override_matches_exact(
             overrides[action.package], action.fix_version
         ):
             return content
 
-        overrides[action.package] = f"^{action.fix_version}"
+        overrides[action.package] = action.fix_version
         data["overrides"] = overrides
 
         return json.dumps(data, indent=2) + "\n"
 
-    def _run_install(self, manifest_paths: set[str]) -> bool:
+    def _run_install(self, actions: list[FixAction]) -> bool:
         """Run package install commands for modified files."""
         success = True
 
-        pkg_dirs: set[Path] = set()
-        for file_path in manifest_paths:
-            if not file_path.endswith("package.json"):
+        install_plans: dict[Path, bool] = {}
+        for action in actions:
+            if not action.file_path.endswith("package.json"):
                 continue
-            pkg_dirs.add(self._resolve_install_dir(file_path))
+            pkg_dir = self._resolve_install_dir(action.file_path)
+            requires_full_install = not action.is_direct
+            install_plans[pkg_dir] = install_plans.get(pkg_dir, False) or requires_full_install
 
-        for pkg_dir in pkg_dirs:
+        removed_repo_node_modules = False
+        for pkg_dir, requires_full_install in install_plans.items():
+            command = ["npm", "install", "--package-lock-only"]
+            if requires_full_install:
+                if not removed_repo_node_modules:
+                    if not self._remove_repo_node_modules():
+                        success = False
+                    removed_repo_node_modules = True
+                for lock_file in PACKAGE_LOCK_FILES:
+                    lock_path = pkg_dir / lock_file
+                    if lock_path.exists():
+                        try:
+                            lock_path.unlink()
+                            if self.verbose:
+                                console.print(f"  Removing stale {lock_path.name} in {pkg_dir}...")
+                        except OSError as e:
+                            if self.verbose:
+                                console.print(
+                                    f"  [yellow]Could not remove {lock_path.name} in {pkg_dir}:[/yellow] {e}"
+                                )
+                            success = False
+                command = ["npm", "install"]
+
             if self.verbose:
-                console.print(f"  Running npm install in {pkg_dir}...")
+                console.print(f"  Running {' '.join(command)} in {pkg_dir}...")
             try:
                 result = subprocess.run(
-                    ["npm", "install", "--package-lock-only"],
+                    command,
                     cwd=pkg_dir,
                     capture_output=True,
                     text=True,
-                    timeout=120,
+                    timeout=300 if requires_full_install else 120,
                 )
                 if result.returncode != 0 and self.verbose:
                     console.print(f"  [yellow]npm install warning:[/yellow] {result.stderr[:200]}")
@@ -406,6 +423,28 @@ class DirectFixer:
                 if self.verbose:
                     console.print(f"  [red]npm install failed:[/red] {e}")
                 success = False
+
+        return success
+
+    def _remove_repo_node_modules(self) -> bool:
+        """Remove all node_modules directories within the repository."""
+        success = True
+        ignored_without_node_modules = IGNORED_DIRS - {"node_modules"}
+
+        for root, dirs, _files in os.walk(self.project_dir, topdown=True):
+            if "node_modules" in dirs:
+                node_modules_dir = Path(root) / "node_modules"
+                try:
+                    shutil.rmtree(node_modules_dir)
+                    if self.verbose:
+                        console.print(f"  Removing {node_modules_dir}...")
+                except OSError as e:
+                    if self.verbose:
+                        console.print(f"  [yellow]Could not remove {node_modules_dir}:[/yellow] {e}")
+                    success = False
+                dirs.remove("node_modules")
+
+            dirs[:] = [d for d in dirs if d not in ignored_without_node_modules]
 
         return success
 
@@ -569,7 +608,7 @@ class DirectFixer:
             if isinstance(overrides, dict) and action.package in overrides:
                 value = overrides[action.package]
                 if isinstance(value, str):
-                    return self._version_matches_spec(value, action.fix_version)
+                    return self._override_matches_exact(value, action.fix_version)
             return False
 
         if file_path.endswith(".txt"):
@@ -581,6 +620,9 @@ class DirectFixer:
         spec_semver = _parse_semver(spec)
         version_semver = _parse_semver(version)
         return spec_semver is not None and spec_semver == version_semver
+
+    def _override_matches_exact(self, spec: str, version: str) -> bool:
+        return spec.strip() == version
 
     def _extract_version_prefix(self, version_spec: str) -> str:
         for prefix in (">=", "<=", "^", "~", ">", "<", "="):

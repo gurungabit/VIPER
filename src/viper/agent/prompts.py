@@ -23,6 +23,7 @@ EXPECTED WORKFLOW:
 - For npm repos, inspect the owning manifest and use `npm ls <package>` once if ownership is unclear.
 - If a package is directly declared, update the manifest to the exact provided target and run the narrowest install command needed to refresh the lockfile.
 - If a package is transitive, prefer package-manager overrides/resolutions in the owning manifest rather than unrelated upgrades.
+- If an override edit is correct but the lockfile or installed tree stays stale, you may delete the relevant package-lock/npm-shrinkwrap file and stale `node_modules` directories, then run one real `npm install`.
 - After editing, do one focused install/lock refresh and at most one focused verification command. The orchestrator will perform the authoritative Snyk rescan after you finish.
 - If one approach fails, use the failure output to choose a different direct bump or override strategy before giving up.
 

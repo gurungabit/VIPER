@@ -158,6 +158,7 @@ class TestCLI:
         assert result.exit_code == 0
         assert "orchestrated batched remediation loop" in result.stdout
         assert "Agent Steps: 40" in result.stdout
+        assert "Pre-edit Budget: 10" in result.stdout
 
     def test_auto_can_disable_streaming(self):
         """auto should allow hiding live agent stream output."""

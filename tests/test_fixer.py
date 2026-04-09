@@ -142,4 +142,58 @@ class TestDirectFixer:
         assert "Refreshed install state" in result.summary
         assert result.changes == []
         run_mock.assert_called_once()
+        assert run_mock.call_args.args[0] == ["npm", "install", "--package-lock-only"]
         assert run_mock.call_args.kwargs["cwd"] == tmp_path
+
+    def test_fix_rewrites_ranged_override_to_exact_target(self, tmp_path: Path):
+        _write_json(
+            tmp_path / "package.json",
+            '{\n  "name": "lambda-app",\n  "private": true,\n  "overrides": {\n    "fast-xml-parser": "^5.5.8"\n  }\n}\n',
+        )
+        (tmp_path / "package-lock.json").write_text('{\n  "name": "lambda-app"\n}\n')
+        (tmp_path / "node_modules" / "leftover").mkdir(parents=True)
+
+        report = SnykParser.parse_json(
+            [
+                {
+                    "ok": False,
+                    "packageManager": "npm",
+                    "projectName": "lambda-app",
+                    "displayTargetFile": "package-lock.json",
+                    "vulnerabilities": [
+                        {
+                            "id": "SNYK-JS-FASTXMLPARSER-1",
+                            "title": "XML Entity Expansion",
+                            "severity": "high",
+                            "packageName": "fast-xml-parser",
+                            "version": "5.4.1",
+                            "from": [
+                                "lambda-app@1.0.0",
+                                "@aws-sdk/xml-builder@3.972.11",
+                                "fast-xml-parser@5.4.1",
+                            ],
+                            "upgradePath": [
+                                False,
+                                "@aws-sdk/xml-builder@3.972.11",
+                                "fast-xml-parser@5.5.8",
+                            ],
+                            "isUpgradable": True,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("viper.fixer.subprocess.run", return_value=completed) as run_mock:
+            result = DirectFixer(tmp_path).fix(report)
+
+        updated = (tmp_path / "package.json").read_text()
+        assert '"fast-xml-parser": "5.5.8"' in updated
+        assert '"fast-xml-parser": "^5.5.8"' not in updated
+        assert not (tmp_path / "package.json.viper.bak").exists()
+        assert not (tmp_path / "package-lock.json").exists()
+        assert not (tmp_path / "node_modules").exists()
+        assert run_mock.call_args.args[0] == ["npm", "install"]
+        assert result.success is True

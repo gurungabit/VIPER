@@ -338,14 +338,18 @@ class ViperAgent:
                 self._emit(
                     "nudge",
                     message=(
-                        "Agent exhausted the pre-edit exploration budget without making a change. "
+                        "Agent hit the pre-edit exploration budget "
+                        f"({self.config.agent.max_no_edit_iterations} turns before the first file change, "
+                        f"{self.config.agent.max_iterations} total turns per cycle). "
                         "Handing control back to the orchestrator."
                     ),
                 )
                 return AgentResult(
                     success=False,
                     summary=(
-                        "Agent exceeded the pre-edit exploration budget without changing files. "
+                        "Agent hit the pre-edit exploration budget before making a file change "
+                        f"({self.config.agent.max_no_edit_iterations} pre-edit turns, "
+                        f"{self.config.agent.max_iterations} total turns per cycle). "
                         "A deterministic fallback or retry should be attempted."
                     ),
                     iterations_used=iteration + 1,

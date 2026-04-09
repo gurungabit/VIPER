@@ -474,6 +474,10 @@ def auto(
         if ai_fix:
             console.print(f"  AI Fix:   [bold]enabled[/bold] (orchestrated batched remediation loop)")
             console.print(f"  Agent Steps: [bold]{cfg.agent.max_iterations}[/bold] max per cycle")
+            console.print(
+                "  Pre-edit Budget: "
+                f"[bold]{cfg.agent.max_no_edit_iterations}[/bold] tool turns before the first file change"
+            )
             console.print(f"  Stream:   [bold]{'enabled' if stream_agent else 'disabled'}[/bold]")
         else:
             console.print(f"  AI Fix:   [bold]disabled[/bold] (deterministic fixer only)")
