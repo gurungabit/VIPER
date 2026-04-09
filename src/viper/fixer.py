@@ -14,10 +14,18 @@ from rich.console import Console
 
 from viper.agent.tools import IGNORED_DIRS
 from viper.models.result import AgentResult, FileChange
-from viper.models.vulnerability import SnykReport
+from viper.models.vulnerability import Severity, SnykReport
 from viper.parsers.snyk_parser import SnykParser
 
 console = Console()
+
+PACKAGE_JSON_DEP_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+PACKAGE_LOCK_FILES = ("package-lock.json", "npm-shrinkwrap.json")
 
 
 def _parse_semver(version: str) -> tuple[int, int, int] | None:
@@ -63,6 +71,11 @@ def _is_safe_upgrade(current: str, target: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _severity_rank(value: str) -> int:
+    """Map a severity string to its numeric rank."""
+    return Severity(value.lower()).rank
+
+
 @dataclass
 class FixAction:
     package: str
@@ -101,8 +114,10 @@ class DirectFixer:
         for a in actions:
             by_file.setdefault(a.file_path, []).append(a)
 
-        applied = []
-        skipped = []
+        applied: list[FixAction] = []
+        refreshed: list[FixAction] = []
+        skipped: list[str] = []
+        install_targets: set[str] = set()
 
         for file_path, file_actions in by_file.items():
             full_path = self.project_dir / file_path
@@ -129,12 +144,23 @@ class DirectFixer:
                 if new_content and new_content != content:
                     content = new_content
                     applied.append(action)
+                    install_targets.add(file_path)
                     method = "direct" if action.is_direct else "override"
                     if self.verbose:
                         console.print(
                             f"  [green]{action.package}: "
                             f"{action.current_version} -> {action.fix_version} "
                             f"in {file_path} ({method})[/green]"
+                        )
+                elif self._action_already_present(content, action, file_path):
+                    refreshed.append(action)
+                    install_targets.add(file_path)
+                    if self.verbose:
+                        method = "direct" if action.is_direct else "override"
+                        console.print(
+                            f"  [cyan]Refresh {action.package}:[/cyan] "
+                            f"{file_path} already requests {action.fix_version} "
+                            f"({method}); refreshing install state"
                         )
                 else:
                     if self.verbose:
@@ -151,10 +177,10 @@ class DirectFixer:
                 full_path.write_text(content)
                 self._changes.append(FileChange(path=file_path))
 
-        # Run npm install if we changed any package.json
+        # Run npm install if we changed or refreshed any package.json
         install_ok = True
-        if not self.dry_run and self._changes:
-            install_ok = self._run_install(by_file)
+        if not self.dry_run and install_targets:
+            install_ok = self._run_install(install_targets)
 
         # Build summary
         summary_parts = []
@@ -164,6 +190,14 @@ class DirectFixer:
                 summary_parts.append(
                     f"  [{a.severity}] {a.package}: {a.current_version} -> {a.fix_version}"
                 )
+        if refreshed:
+            summary_parts.append(
+                f"\nRefreshed install state for {len(refreshed)} already-pinned packages:"
+            )
+            for a in refreshed:
+                summary_parts.append(
+                    f"  [{a.severity}] {a.package}: manifest already requests {a.fix_version}"
+                )
         if skipped:
             summary_parts.append(f"\nSkipped {len(skipped)}:")
             for s in skipped:
@@ -172,7 +206,7 @@ class DirectFixer:
             summary_parts.append("\nWARNING: npm install had errors (see above)")
 
         return AgentResult(
-            success=len(applied) > 0,
+            success=len(applied) > 0 or len(refreshed) > 0,
             summary="\n".join(summary_parts),
             changes=self._changes,
             tests_passed=None,
@@ -182,40 +216,26 @@ class DirectFixer:
     def _plan_fixes(self, report: SnykReport) -> list[FixAction]:
         """Build list of fix actions from the Snyk report."""
         vulns = SnykParser.deduplicate(report.vulnerabilities)
-        groups = SnykParser.group_by_package(vulns)
 
         # Find all dependency files
         dep_files = self._find_dep_files()
+        actions_by_key: dict[tuple[str, str, bool], FixAction] = {}
+        grouped_vulns: dict[tuple[str, str], list] = {}
 
-        actions = []
-        seen_packages: set[str] = set()
+        for vuln in vulns:
+            manifest_hint = self._choose_manifest_hint(vuln, dep_files) or ""
+            grouped_vulns.setdefault((vuln.package_name, manifest_hint), []).append(vuln)
 
-        for pkg_name, pkg_vulns in groups.items():
+        for (pkg_name, manifest_hint), pkg_vulns in grouped_vulns.items():
             if not any(v.is_upgradable for v in pkg_vulns):
                 continue
-            if pkg_name in seen_packages:
-                continue
-            seen_packages.add(pkg_name)
 
-            # Find fix version — must match the vulnerable package name
-            fix_version = None
-            for v in pkg_vulns:
-                for p in v.upgrade_path:
-                    if isinstance(p, str) and "@" in p:
-                        # upgrade_path entries are like "package@version"
-                        # Only use it if it's for THIS package
-                        parts = p.rsplit("@", 1)
-                        if len(parts) == 2 and parts[0] == pkg_name:
-                            fix_version = parts[1]
-                            break
-                if fix_version:
-                    break
-
+            fix_version = self._select_fix_version(pkg_name, pkg_vulns)
             if not fix_version:
                 continue
 
             current = pkg_vulns[0].version
-            max_sev = max(v.severity.value for v in pkg_vulns).upper()
+            max_sev = max(pkg_vulns, key=lambda vuln: vuln.severity.rank).severity.value.upper()
             vuln_ids = [v.id for v in pkg_vulns]
 
             # Validate the upgrade is safe
@@ -226,26 +246,20 @@ class DirectFixer:
                 continue
 
             # Check if DIRECT dependency (in dependencies/devDependencies)
-            found_in = []
-            for dep_file in dep_files:
-                try:
-                    if dep_file.endswith(".json"):
-                        data = json.loads((self.project_dir / dep_file).read_text())
-                        deps = data.get("dependencies", {})
-                        dev_deps = data.get("devDependencies", {})
-                        if pkg_name in deps or pkg_name in dev_deps:
-                            found_in.append(dep_file)
-                    else:
-                        # requirements.txt, pom.xml — simple text check
-                        content = (self.project_dir / dep_file).read_text()
-                        if pkg_name in content:
-                            found_in.append(dep_file)
-                except (OSError, json.JSONDecodeError):
-                    pass
+            candidate_files = [manifest_hint] if manifest_hint else dep_files
+            found_in = [
+                dep_file for dep_file in candidate_files
+                if dep_file and self._manifest_has_direct_dependency(dep_file, pkg_name)
+            ]
+
+            if not found_in and manifest_hint and self._manifest_has_direct_dependency(
+                manifest_hint, pkg_name
+            ):
+                found_in = [manifest_hint]
 
             if found_in:
                 for f in found_in:
-                    actions.append(FixAction(
+                    action = FixAction(
                         package=pkg_name,
                         current_version=current,
                         fix_version=fix_version,
@@ -253,37 +267,14 @@ class DirectFixer:
                         file_path=f,
                         is_direct=True,
                         vuln_ids=vuln_ids,
-                    ))
-            else:
-                # Transitive — add override to the nearest package.json
-                # Try to find which sub-project this vuln belongs to using
-                # the Snyk "from" path (first entry is the project name)
-                target_pkg = None
-                for v in pkg_vulns:
-                    if v.from_path:
-                        # from_path[0] is like "project-name@version"
-                        project_id = v.from_path[0].rsplit("@", 1)[0] if v.from_path[0] else ""
-                        # Find the package.json whose "name" matches
-                        for df in dep_files:
-                            if not df.endswith("package.json"):
-                                continue
-                            try:
-                                d = json.loads((self.project_dir / df).read_text())
-                                if d.get("name", "") == project_id:
-                                    target_pkg = df
-                                    break
-                            except (OSError, json.JSONDecodeError):
-                                pass
-                    if target_pkg:
-                        break
-
-                if not target_pkg:
-                    target_pkg = next(
-                        (f for f in dep_files if f == "package.json"),
-                        dep_files[0] if dep_files else "package.json",
                     )
+                    self._merge_action(actions_by_key, action)
+            else:
+                target_pkg = self._choose_override_manifest(pkg_vulns, dep_files, manifest_hint)
+                if not target_pkg:
+                    continue
 
-                actions.append(FixAction(
+                action = FixAction(
                     package=pkg_name,
                     current_version=current,
                     fix_version=fix_version,
@@ -291,9 +282,10 @@ class DirectFixer:
                     file_path=target_pkg,
                     is_direct=False,
                     vuln_ids=vuln_ids,
-                ))
+                )
+                self._merge_action(actions_by_key, action)
 
-        return actions
+        return list(actions_by_key.values())
 
     def _find_dep_files(self) -> list[str]:
         """Find all dependency files in the project."""
@@ -318,25 +310,22 @@ class DirectFixer:
             return None
 
         if file_path.endswith(".json"):
-            # Try exact match: "package": "version"
-            # Handle various version prefixes: ^, ~, >=, etc.
-            import re
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                return None
 
-            pattern = re.compile(
-                rf'("{re.escape(action.package)}"\s*:\s*")([^"]*{re.escape(action.current_version)}[^"]*)"'
-            )
-            match = pattern.search(content)
-            if match:
-                prefix = match.group(1)
-                old_ver = match.group(2)
-                # Preserve version prefix (^, ~, etc.)
-                ver_prefix = ""
-                for p in ("^", "~", ">=", ">", "<=", "<", "="):
-                    if old_ver.startswith(p):
-                        ver_prefix = p
-                        break
-                new_ver_str = f"{ver_prefix}{action.fix_version}"
-                return content[:match.start()] + f'{prefix}{new_ver_str}"' + content[match.end():]
+            for section in PACKAGE_JSON_DEP_SECTIONS:
+                deps = data.get(section)
+                if not isinstance(deps, dict) or action.package not in deps:
+                    continue
+
+                old_spec = str(deps[action.package])
+                if self._version_matches_spec(old_spec, action.fix_version):
+                    return content
+
+                deps[action.package] = f"{self._extract_version_prefix(old_spec)}{action.fix_version}"
+                return json.dumps(data, indent=2) + "\n"
 
         elif file_path.endswith(".txt"):
             # requirements.txt: package==version
@@ -371,21 +360,25 @@ class DirectFixer:
             return None
 
         overrides = data.get("overrides", {})
+        if isinstance(overrides.get(action.package), str) and self._version_matches_spec(
+            overrides[action.package], action.fix_version
+        ):
+            return content
+
         overrides[action.package] = f"^{action.fix_version}"
         data["overrides"] = overrides
 
         return json.dumps(data, indent=2) + "\n"
 
-    def _run_install(self, by_file: dict[str, list[FixAction]]) -> bool:
+    def _run_install(self, manifest_paths: set[str]) -> bool:
         """Run package install commands for modified files."""
         success = True
 
-        # Find unique directories with modified package.json files
-        pkg_dirs: set[str] = set()
-        for file_path in by_file:
-            if file_path.endswith("package.json"):
-                pkg_dir = str((self.project_dir / file_path).parent)
-                pkg_dirs.add(pkg_dir)
+        pkg_dirs: set[Path] = set()
+        for file_path in manifest_paths:
+            if not file_path.endswith("package.json"):
+                continue
+            pkg_dirs.add(self._resolve_install_dir(file_path))
 
         for pkg_dir in pkg_dirs:
             if self.verbose:
@@ -407,3 +400,213 @@ class DirectFixer:
                 success = False
 
         return success
+
+    def _merge_action(
+        self,
+        actions_by_key: dict[tuple[str, str, bool], FixAction],
+        action: FixAction,
+    ) -> None:
+        key = (action.package, action.file_path, action.is_direct)
+        existing = actions_by_key.get(key)
+        if existing is None:
+            actions_by_key[key] = action
+            return
+
+        existing.vuln_ids = sorted(set(existing.vuln_ids + action.vuln_ids))
+        if _severity_rank(action.severity) > _severity_rank(existing.severity):
+            existing.severity = action.severity
+
+        cur_fix = _parse_semver(existing.fix_version)
+        new_fix = _parse_semver(action.fix_version)
+        if cur_fix is None or (new_fix is not None and new_fix > cur_fix):
+            existing.fix_version = action.fix_version
+
+    def _select_fix_version(self, package_name: str, vulns: list) -> str | None:
+        versions: list[str] = []
+        for vuln in vulns:
+            for path_entry in vuln.upgrade_path:
+                if not isinstance(path_entry, str) or "@" not in path_entry:
+                    continue
+                dep_name, version = path_entry.rsplit("@", 1)
+                if dep_name == package_name:
+                    versions.append(version)
+
+        if not versions:
+            return None
+
+        return max(versions, key=lambda version: _parse_semver(version) or (0, 0, 0))
+
+    def _manifest_has_direct_dependency(self, dep_file: str, package_name: str) -> bool:
+        try:
+            content = (self.project_dir / dep_file).read_text()
+        except OSError:
+            return False
+
+        if dep_file.endswith(".json"):
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                return False
+
+            for section in PACKAGE_JSON_DEP_SECTIONS:
+                deps = data.get(section, {})
+                if isinstance(deps, dict) and package_name in deps:
+                    return True
+            return False
+
+        if dep_file.endswith(".txt"):
+            pattern = re.compile(rf"^\s*{re.escape(package_name)}(?:\[.*\])?\s*(?:==|>=|~=)", re.MULTILINE)
+            return bool(pattern.search(content))
+
+        if dep_file.endswith(".xml"):
+            return f"<artifactId>{package_name}</artifactId>" in content
+
+        return False
+
+    def _choose_manifest_hint(self, vuln, dep_files: list[str]) -> str | None:
+        dep_file_set = set(dep_files)
+
+        for candidate in self._target_file_candidates(vuln.display_target_file or ""):
+            if candidate in dep_file_set:
+                return candidate
+
+        for project_name in filter(None, [vuln.source_project_name, vuln.from_path[0] if vuln.from_path else ""]):
+            normalized_name = project_name.rsplit("@", 1)[0]
+            for dep_file in dep_files:
+                if not dep_file.endswith("package.json"):
+                    continue
+                try:
+                    data = json.loads((self.project_dir / dep_file).read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if data.get("name", "") == normalized_name:
+                    return dep_file
+
+        return None
+
+    def _choose_override_manifest(
+        self, vulns: list, dep_files: list[str], manifest_hint: str
+    ) -> str | None:
+        dep_file_set = set(dep_files)
+
+        if manifest_hint and manifest_hint.endswith("package.json"):
+            return manifest_hint
+
+        for vuln in vulns:
+            for candidate in self._target_file_candidates(vuln.display_target_file or ""):
+                if candidate.endswith("package.json") and candidate in dep_file_set:
+                    return candidate
+
+        for vuln in vulns:
+            project_name = vuln.source_project_name or (vuln.from_path[0] if vuln.from_path else "")
+            if not project_name:
+                continue
+            normalized_name = project_name.rsplit("@", 1)[0]
+            for dep_file in dep_files:
+                if not dep_file.endswith("package.json"):
+                    continue
+                try:
+                    data = json.loads((self.project_dir / dep_file).read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if data.get("name", "") == normalized_name:
+                    return dep_file
+
+        package_jsons = [dep_file for dep_file in dep_files if dep_file.endswith("package.json")]
+        if not package_jsons:
+            return None
+        return next((dep_file for dep_file in package_jsons if dep_file == "package.json"), package_jsons[0])
+
+    def _target_file_candidates(self, raw_target_file: str) -> list[str]:
+        if not raw_target_file:
+            return []
+
+        normalized = raw_target_file.lstrip("./").replace("\\", "/")
+        path = Path(normalized)
+        candidates: list[str] = []
+
+        if normalized:
+            candidates.append(normalized)
+
+        if path.name in PACKAGE_LOCK_FILES:
+            candidates.append(str(path.with_name("package.json")))
+
+        parent = path.parent
+        while True:
+            for manifest_name in ("package.json", "requirements.txt", "pyproject.toml", "pom.xml"):
+                candidate = manifest_name if str(parent) == "." else str(parent / manifest_name)
+                if candidate not in candidates:
+                    candidates.append(candidate)
+            if str(parent) == ".":
+                break
+            parent = parent.parent
+
+        return candidates
+
+    def _action_already_present(self, content: str, action: FixAction, file_path: str) -> bool:
+        if file_path.endswith(".json"):
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                return False
+
+            if action.is_direct:
+                for section in PACKAGE_JSON_DEP_SECTIONS:
+                    deps = data.get(section, {})
+                    if not isinstance(deps, dict) or action.package not in deps:
+                        continue
+                    return self._version_matches_spec(str(deps[action.package]), action.fix_version)
+
+            overrides = data.get("overrides", {})
+            if isinstance(overrides, dict) and action.package in overrides:
+                value = overrides[action.package]
+                if isinstance(value, str):
+                    return self._version_matches_spec(value, action.fix_version)
+            return False
+
+        if file_path.endswith(".txt"):
+            return f"{action.package}=={action.fix_version}" in content
+
+        return False
+
+    def _version_matches_spec(self, spec: str, version: str) -> bool:
+        spec_semver = _parse_semver(spec)
+        version_semver = _parse_semver(version)
+        return spec_semver is not None and spec_semver == version_semver
+
+    def _extract_version_prefix(self, version_spec: str) -> str:
+        for prefix in (">=", "<=", "^", "~", ">", "<", "="):
+            if version_spec.startswith(prefix):
+                return prefix
+        return ""
+
+    def _resolve_install_dir(self, file_path: str) -> Path:
+        manifest_path = (self.project_dir / file_path).resolve()
+        package_dir = manifest_path.parent
+
+        if any((package_dir / lock_file).exists() for lock_file in PACKAGE_LOCK_FILES):
+            return package_dir
+
+        workspace_root = self._find_workspace_root(package_dir)
+        if workspace_root is not None:
+            return workspace_root
+
+        return package_dir
+
+    def _find_workspace_root(self, start_dir: Path) -> Path | None:
+        current = start_dir
+        while True:
+            package_json = current / "package.json"
+            if package_json.exists():
+                try:
+                    data = json.loads(package_json.read_text())
+                except (OSError, json.JSONDecodeError):
+                    data = {}
+                if "workspaces" in data:
+                    return current
+
+            if current == self.project_dir or current.parent == current:
+                break
+            current = current.parent
+
+        return None

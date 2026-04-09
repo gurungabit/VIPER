@@ -15,6 +15,21 @@ class SnykParser:
     """Parse Snyk JSON reports and run scans."""
 
     @staticmethod
+    def _parse_report_item(data: dict) -> SnykReport:
+        """Parse one Snyk report item and stamp per-project metadata on each vulnerability."""
+        report = SnykReport.model_validate(data)
+        project_name = data.get("projectName", report.project_name)
+        target_file = data.get("displayTargetFile") or data.get("targetFile") or ""
+        project_path = data.get("path", "")
+
+        for vuln in report.vulnerabilities:
+            vuln.source_project_name = project_name
+            vuln.display_target_file = target_file
+            vuln.project_path = project_path
+
+        return report
+
+    @staticmethod
     def run_scan(
         project_dir: Path,
         snyk_token: str | None = None,
@@ -123,13 +138,13 @@ class SnykParser:
             # Merge multiple reports
             all_vulns = []
             for item in data:
-                report = SnykReport.model_validate(item)
+                report = SnykParser._parse_report_item(item)
                 all_vulns.extend(report.vulnerabilities)
-            merged = SnykReport.model_validate(data[0])
+            merged = SnykParser._parse_report_item(data[0])
             merged.vulnerabilities = all_vulns
             return merged
 
-        return SnykReport.model_validate(data)
+        return SnykParser._parse_report_item(data)
 
     @staticmethod
     def filter_by_severity(
@@ -150,11 +165,19 @@ class SnykParser:
 
     @staticmethod
     def deduplicate(vulns: list[Vulnerability]) -> list[Vulnerability]:
-        """Remove duplicate vulnerabilities by ID."""
-        seen: set[str] = set()
+        """Remove duplicate vulnerability entries while preserving per-project occurrences."""
+        seen: set[tuple[str, str, str, tuple[str, ...], str, str]] = set()
         unique = []
         for v in vulns:
-            if v.id not in seen:
-                seen.add(v.id)
+            key = (
+                v.id,
+                v.package_name,
+                v.version,
+                tuple(v.from_path),
+                v.display_target_file,
+                v.source_project_name,
+            )
+            if key not in seen:
+                seen.add(key)
                 unique.append(v)
         return unique

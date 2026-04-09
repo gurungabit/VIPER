@@ -62,6 +62,55 @@ class TestSnykParser:
         unique = SnykParser.deduplicate(duped)
         assert len(unique) == 3
 
+    def test_deduplicate_preserves_same_vuln_in_multiple_projects(self):
+        data = [
+            {
+                "ok": False,
+                "packageManager": "npm",
+                "projectName": "root-app",
+                "displayTargetFile": "package.json",
+                "vulnerabilities": [
+                    {
+                        "id": "SNYK-JS-LODASH-1",
+                        "title": "Prototype Pollution",
+                        "severity": "high",
+                        "packageName": "lodash",
+                        "version": "4.17.20",
+                        "from": ["root-app@1.0.0", "lodash@4.17.20"],
+                        "upgradePath": [False, "lodash@4.17.21"],
+                        "isUpgradable": True,
+                    }
+                ],
+            },
+            {
+                "ok": False,
+                "packageManager": "npm",
+                "projectName": "client-app",
+                "displayTargetFile": "client/package.json",
+                "vulnerabilities": [
+                    {
+                        "id": "SNYK-JS-LODASH-1",
+                        "title": "Prototype Pollution",
+                        "severity": "high",
+                        "packageName": "lodash",
+                        "version": "4.17.20",
+                        "from": ["client-app@1.0.0", "lodash@4.17.20"],
+                        "upgradePath": [False, "lodash@4.17.21"],
+                        "isUpgradable": True,
+                    }
+                ],
+            },
+        ]
+
+        report = SnykParser.parse_json(data)
+        unique = SnykParser.deduplicate(report.vulnerabilities)
+
+        assert len(unique) == 2
+        assert {v.display_target_file for v in unique} == {
+            "package.json",
+            "client/package.json",
+        }
+
     def test_vulnerability_severity_ordering(self):
         assert Severity.critical > Severity.high
         assert Severity.high > Severity.medium
