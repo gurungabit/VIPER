@@ -31,7 +31,7 @@ class AIConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    max_iterations: int = 15
+    max_iterations: int = 40
     timeout_per_tool: int = 300
     blocked_commands: list[str] = Field(
         default_factory=lambda: [
@@ -55,7 +55,7 @@ class ViperConfig(BaseSettings):
     gitlab: GitLabConfig = Field(default_factory=GitLabConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
-    severity_threshold: str = "medium"
+    severity_threshold: str = "high"
     dry_run: bool = False
 
     model_config = {"env_prefix": "VIPER_", "env_nested_delimiter": "__"}

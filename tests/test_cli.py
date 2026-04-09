@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from typer.testing import CliRunner
 
 from viper.cli import app
+from viper.config import ViperConfig
 from viper.models.result import AgentResult, FileChange
 from viper.models.vulnerability import SnykReport
 from viper.parsers.snyk_parser import SnykParser
@@ -118,6 +119,42 @@ class TestCLI:
             assert result.exit_code == 0
             assert "clean" in result.stdout.lower() or "No vulnerabilities" in result.stdout
 
+    def test_auto_ignores_medium_only_findings_by_default(self):
+        """auto should only act on high+ findings unless a lower threshold is requested."""
+        medium_report = SnykParser.parse_json(
+            {
+                "ok": False,
+                "packageManager": "npm",
+                "projectName": "my-project",
+                "dependencyCount": 2,
+                "vulnerabilities": [
+                    {
+                        "id": "SNYK-JS-LODASH-LOWER",
+                        "title": "Prototype Pollution",
+                        "severity": "medium",
+                        "packageName": "lodash",
+                        "version": "4.17.15",
+                        "from": ["my-project@1.0.0", "lodash@4.17.15"],
+                        "upgradePath": [False, "lodash@4.17.21"],
+                        "isUpgradable": True,
+                    }
+                ],
+            }
+        )
+
+        with patch(
+            "viper.cli.SnykParser.run_scan",
+            return_value=medium_report,
+        ), patch("viper.agent.loop.ViperAgent") as mock_agent_cls, patch(
+            "viper.fixer.DirectFixer"
+        ) as mock_fixer_cls:
+            result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
+
+        assert result.exit_code == 0
+        assert "No vulnerabilities found" in result.stdout
+        mock_agent_cls.assert_not_called()
+        mock_fixer_cls.assert_not_called()
+
     def test_auto_prefers_ai_agent_by_default(self):
         """auto should use the agent first and skip deterministic fallback when AI makes changes."""
         vuln_report = self._build_vuln_report()
@@ -142,6 +179,7 @@ class TestCLI:
         assert result.exit_code == 0
         assert "agent-first remediation loop" in result.stdout
         assert "AI fixed lodash" in result.stdout
+        assert "Agent Steps: 40" in result.stdout
         mock_fixer_cls.assert_not_called()
 
     def test_auto_falls_back_when_ai_makes_no_changes(self):
@@ -175,3 +213,37 @@ class TestCLI:
         assert result.exit_code == 0
         assert "falling back to deterministic version upgrades" in result.stdout.lower()
         mock_fixer_cls.assert_called_once()
+
+    def test_auto_passes_agent_iteration_override(self):
+        """auto should honor the per-run agent iteration override."""
+        vuln_report = self._build_vuln_report()
+        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=0)
+
+        captured_iterations: list[int] = []
+
+        class FakeAgent:
+            def __init__(self, config: ViperConfig, project_dir: Path, verbose: bool = False):
+                captured_iterations.append(config.agent.max_iterations)
+
+            async def run_fix(self, report: SnykReport) -> AgentResult:
+                return AgentResult(
+                    success=True,
+                    summary="AI fixed lodash via direct bump",
+                    changes=[FileChange(path="package.json")],
+                )
+
+        with patch(
+            "viper.cli.SnykParser.run_scan",
+            side_effect=[vuln_report, clean_report],
+        ), patch("viper.agent.loop.ViperAgent", FakeAgent), patch(
+            "viper.fixer.DirectFixer"
+        ) as mock_fixer_cls:
+            result = runner.invoke(
+                app,
+                ["auto", "--project-dir", "/tmp", "--agent-max-iterations", "60"],
+            )
+
+        assert result.exit_code == 0
+        assert captured_iterations == [60]
+        assert "Agent Steps: 60" in result.stdout
+        mock_fixer_cls.assert_not_called()

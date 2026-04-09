@@ -14,7 +14,7 @@ ai:
   max_tokens: 4096
 
 agent:
-  max_iterations: 30
+  max_iterations: 40
   timeout_per_tool: 300
   blocked_commands:
     - "rm -rf /"
@@ -28,5 +28,5 @@ agent:
     - "pnpm up"
 
 settings:
-  severity_threshold: medium
+  severity_threshold: high
   dry_run: false

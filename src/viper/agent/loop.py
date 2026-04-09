@@ -55,41 +55,44 @@ class ViperAgent:
             verbose=verbose,
         )
 
-    @staticmethod
-    def _compact_report(report: SnykReport) -> str:
-        """Build a compact text summary of the Snyk report to fit in context."""
+    def _compact_report(self, report: SnykReport) -> str:
+        """Build a compact, strategic summary of the Snyk report to fit in context."""
         from viper.parsers.snyk_parser import SnykParser
+        from viper.fixer import DirectFixer
 
         vulns = SnykParser.deduplicate(report.vulnerabilities)
-        upgradable = [v for v in vulns if v.is_upgradable]
+        planned_actions = DirectFixer(
+            project_dir=self.project_dir,
+            dry_run=True,
+            verbose=False,
+        )._plan_fixes(report)
         non_upgradable = [v for v in vulns if not v.is_upgradable]
 
         lines = [
             f"Package Manager: {report.package_manager}",
             f"Total Vulnerabilities: {len(vulns)}",
-            f"Upgradable Occurrences: {len(upgradable)} | Non-upgradable Occurrences: {len(non_upgradable)}",
+            f"Actionable Fix Candidates: {len(planned_actions)} | Non-upgradable Occurrences: {len(non_upgradable)}",
             "",
         ]
 
-        if upgradable:
-            lines.append("ACTIONABLE VULNERABILITIES:")
+        if planned_actions:
+            lines.append("STRATEGIC FIX CANDIDATES:")
             lines.append("=" * 60)
-            for vuln in sorted(
-                upgradable,
+            severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            for action in sorted(
+                planned_actions,
                 key=lambda item: (
-                    item.severity.rank,
-                    item.source_project_name or item.display_target_file,
-                    item.package_name,
+                    severity_rank.get(item.severity, 0),
+                    item.file_path,
+                    item.package,
                 ),
                 reverse=True,
             ):
-                upgrade_target = ViperAgent._matching_upgrade_target(vuln)
-                location = vuln.display_target_file or vuln.source_project_name or "unknown target"
                 lines.append(
-                    f"- [{vuln.severity.value.upper()}] {vuln.package_name}@{vuln.version}"
-                    f" -> {upgrade_target or 'manual'} | target={location} | id={vuln.id}"
+                    f"- [{action.severity}] {action.package}@{action.current_version}"
+                    f" -> {action.fix_version} | file={action.file_path}"
+                    f" | mode={'direct' if action.is_direct else 'override'}"
                 )
-                lines.append(f"  {vuln.title}")
 
         if non_upgradable:
             lines.append(f"\nNON-UPGRADABLE OR MANUAL ({len(non_upgradable)} occurrences):")

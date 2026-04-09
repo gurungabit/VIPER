@@ -64,6 +64,34 @@ def _run_scan_with_progress(
         )
 
 
+def _filter_report_by_severity(report: SnykReport, min_severity: Severity) -> SnykReport:
+    """Return a report copy containing only vulnerabilities at or above the threshold."""
+    filtered = SnykParser.filter_by_severity(report, min_severity)
+    return report.model_copy(
+        update={
+            "vulnerabilities": filtered,
+            "unique_count": len(SnykParser.deduplicate(filtered)),
+            "ok": len(filtered) == 0,
+        }
+    )
+
+
+def _resolve_remediation_severity(
+    requested: str | None,
+    config: ViperConfig,
+) -> str:
+    """Resolve the effective severity for remediation commands.
+
+    Unless the user explicitly passes --severity, remediation defaults to high+
+    even if an older config file still says medium.
+    """
+    if requested:
+        return requested
+
+    configured = config.severity_threshold or "high"
+    return configured if Severity(configured) >= Severity.high else Severity.high.value
+
+
 def _display_vulns(report: SnykReport, severity_filter: str | None = None) -> int:
     """Display vulnerabilities in a Rich table. Returns count displayed."""
     vulns = report.vulnerabilities
@@ -176,7 +204,7 @@ ai:
   max_tokens: 4096
 
 agent:
-  max_iterations: 30
+  max_iterations: 40
   timeout_per_tool: 300
   blocked_commands:
     - "rm -rf /"
@@ -189,7 +217,7 @@ agent:
     - "pnpm up"
 
 settings:
-  severity_threshold: medium   # low, medium, high, critical
+  severity_threshold: high   # low, medium, high, critical
   dry_run: false
 """
     output.write_text(config_content)
@@ -254,23 +282,26 @@ def fix(
     try:
         cfg = _load_config(config)
         target_dir = project_dir or Path.cwd()
+        sev_threshold = _resolve_remediation_severity(severity, cfg)
 
         if report_file:
             report = SnykParser.parse_file(report_file)
         else:
             report = _run_scan_with_progress(target_dir, cfg)
 
-        if report.ok and not report.vulnerabilities:
-            console.print("[green]No vulnerabilities found![/green]")
+        filtered_report = _filter_report_by_severity(report, Severity(sev_threshold))
+
+        if not filtered_report.vulnerabilities:
+            console.print(f"[green]No vulnerabilities found at {sev_threshold}+ severity![/green]")
             raise typer.Exit()
 
-        _display_vulns(report, severity)
+        _display_vulns(filtered_report)
 
         from viper.fixer import DirectFixer
 
         console.print()
         fixer = DirectFixer(project_dir=target_dir, dry_run=dry_run, verbose=True)
-        result = fixer.fix(report)
+        result = fixer.fix(filtered_report)
 
         if result.success:
             console.print(f"\n[green]Fix complete![/green]")
@@ -295,12 +326,15 @@ def report(
     """Generate a vulnerability remediation report."""
     try:
         cfg = _load_config(config)
+        sev_threshold = severity or cfg.severity_threshold
 
         if report_file:
             snyk_report = SnykParser.parse_file(report_file)
         else:
             target = project_dir or Path.cwd()
             snyk_report = _run_scan_with_progress(target, cfg)
+
+        snyk_report = _filter_report_by_severity(snyk_report, Severity(sev_threshold))
 
         from viper.report_generator import ReportGenerator
 
@@ -328,16 +362,24 @@ def mr(
     severity: Optional[str] = typer.Option(None, "--severity", "-s", help="Minimum severity"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
     target_branch: Optional[str] = typer.Option(None, "--target-branch", help="MR target branch"),
+    agent_max_iterations: Optional[int] = typer.Option(
+        None,
+        "--agent-max-iterations",
+        help="Override the AI agent tool-use iteration limit for this run",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show changes without creating MR"),
     verbose: bool = typer.Option(False, "--verbose", help="Show agent tool calls"),
 ) -> None:
     """Fix vulnerabilities and create a GitLab merge request."""
     try:
         cfg = _load_config(config)
+        sev_threshold = _resolve_remediation_severity(severity, cfg)
         if dry_run:
             cfg.dry_run = True
         if target_branch:
             cfg.gitlab.target_branch = target_branch
+        if agent_max_iterations is not None:
+            cfg.agent.max_iterations = agent_max_iterations
 
         target_dir = project_dir or Path.cwd()
 
@@ -346,8 +388,10 @@ def mr(
         else:
             report = _run_scan_with_progress(target_dir, cfg)
 
-        if report.ok and not report.vulnerabilities:
-            console.print("[green]No vulnerabilities found![/green]")
+        filtered_report = _filter_report_by_severity(report, Severity(sev_threshold))
+
+        if not filtered_report.vulnerabilities:
+            console.print(f"[green]No vulnerabilities found at {sev_threshold}+ severity![/green]")
             raise typer.Exit()
 
         from viper.agent.loop import ViperAgent
@@ -360,7 +404,7 @@ def mr(
         ) as progress:
             progress.add_task("AI agent fixing vulnerabilities...", total=None)
             agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
-            result = asyncio.run(agent.run_fix(report))
+            result = asyncio.run(agent.run_fix(filtered_report))
 
         if not result.success:
             console.print(f"[red]Fix failed:[/red] {result.summary}")
@@ -381,7 +425,7 @@ def mr(
         ) as progress:
             progress.add_task("Creating GitLab merge request...", total=None)
             gl = GitLabClient(cfg.gitlab)
-            mr_url = asyncio.run(gl.create_fix_mr(result, report))
+            mr_url = asyncio.run(gl.create_fix_mr(result, filtered_report))
 
         console.print(f"\n[green]Merge request created:[/green] {mr_url}")
 
@@ -396,6 +440,11 @@ def auto(
     severity: Optional[str] = typer.Option(None, "--severity", "-s", help="Minimum severity"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
     max_cycles: int = typer.Option(10, "--max-cycles", "-n", help="Max fix-verify loops"),
+    agent_max_iterations: Optional[int] = typer.Option(
+        None,
+        "--agent-max-iterations",
+        help="Override the AI agent tool-use iteration limit for this run",
+    ),
     verbose: bool = typer.Option(False, "--verbose", help="Show details"),
     ai_fix: bool = typer.Option(
         True,
@@ -406,8 +455,10 @@ def auto(
     """Agentic remediation loop: scan -> fix -> validate -> repeat until clean or capped."""
     try:
         cfg = _load_config(config)
+        if agent_max_iterations is not None:
+            cfg.agent.max_iterations = agent_max_iterations
         target_dir = project_dir or Path.cwd()
-        sev_threshold = severity or cfg.severity_threshold
+        sev_threshold = _resolve_remediation_severity(severity, cfg)
 
         console.print(VIPER_BANNER.format(__version__))
         console.print(f"  Project:  [bold]{target_dir}[/bold]")
@@ -415,6 +466,7 @@ def auto(
         console.print(f"  Cycles:   [bold]{max_cycles}[/bold] max")
         if ai_fix:
             console.print(f"  AI Fix:   [bold]enabled[/bold] (agent-first remediation loop)")
+            console.print(f"  Agent Steps: [bold]{cfg.agent.max_iterations}[/bold] max per cycle")
         else:
             console.print(f"  AI Fix:   [bold]disabled[/bold] (deterministic fixer only)")
         console.print()
@@ -453,8 +505,8 @@ def auto(
                     console.print(f"[red]Scan error:[/red] {e}")
                     raise typer.Exit(1)
 
-            vulns = SnykParser.filter_by_severity(report, Severity(sev_threshold))
-            vulns = SnykParser.deduplicate(vulns)
+            filtered_report = _filter_report_by_severity(report, Severity(sev_threshold))
+            vulns = SnykParser.deduplicate(filtered_report.vulnerabilities)
 
             if not vulns:
                 console.print(
@@ -469,7 +521,7 @@ def auto(
                 f"  [bold]Found {len(vulns)} vulnerabilities[/bold] "
                 f"(from {report.dependency_count} dependencies)\n"
             )
-            _display_vulns(report, severity)
+            _display_vulns(filtered_report)
 
             # ── FIX (Phase 1: Agent-first remediation) ────────────
             console.print()
@@ -496,7 +548,7 @@ def auto(
                         from viper.agent.loop import ViperAgent
 
                         agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
-                        ai_result = asyncio.run(agent.run_fix(report))
+                        ai_result = asyncio.run(agent.run_fix(filtered_report))
                     except Exception as e:
                         ai_error = e
 
@@ -531,7 +583,7 @@ def auto(
                 console.print()
                 console.print("[bold][2/3] Applying deterministic version upgrades...[/bold]")
                 fixer = DirectFixer(project_dir=target_dir, verbose=True)
-                result = fixer.fix(report)
+                result = fixer.fix(filtered_report)
                 console.print(f"\n{result.summary}")
                 cycle_changes.extend(result.changes)
                 all_changes.extend(result.changes)
