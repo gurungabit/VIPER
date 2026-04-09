@@ -333,6 +333,7 @@ class ViperAgent:
 
             if (
                 not has_made_edits
+                and self.config.agent.max_no_edit_iterations < self.config.agent.max_iterations
                 and no_edit_iterations >= self.config.agent.max_no_edit_iterations
             ):
                 self._emit(

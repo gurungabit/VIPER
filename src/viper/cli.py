@@ -205,7 +205,7 @@ ai:
 
 agent:
   max_iterations: 40
-  max_no_edit_iterations: 10
+  max_no_edit_iterations: 40
   timeout_per_tool: 300
   blocked_commands:
     - "rm -rf /"
@@ -463,7 +463,10 @@ def auto(
     try:
         cfg = _load_config(config)
         if agent_max_iterations is not None:
+            previous_max_iterations = cfg.agent.max_iterations
             cfg.agent.max_iterations = agent_max_iterations
+            if cfg.agent.max_no_edit_iterations >= previous_max_iterations:
+                cfg.agent.max_no_edit_iterations = agent_max_iterations
         target_dir = project_dir or Path.cwd()
         sev_threshold = _resolve_remediation_severity(severity, cfg)
 
@@ -474,10 +477,16 @@ def auto(
         if ai_fix:
             console.print(f"  AI Fix:   [bold]enabled[/bold] (orchestrated batched remediation loop)")
             console.print(f"  Agent Steps: [bold]{cfg.agent.max_iterations}[/bold] max per cycle")
-            console.print(
-                "  Pre-edit Budget: "
-                f"[bold]{cfg.agent.max_no_edit_iterations}[/bold] tool turns before the first file change"
-            )
+            if cfg.agent.max_no_edit_iterations < cfg.agent.max_iterations:
+                console.print(
+                    "  Pre-edit Budget: "
+                    f"[bold]{cfg.agent.max_no_edit_iterations}[/bold] tool turns before the first file change"
+                )
+            else:
+                console.print(
+                    "  Pre-edit Budget: [bold]same as total step cap[/bold] "
+                    "(no early handoff before the full agent budget is used)"
+                )
             console.print(f"  Stream:   [bold]{'enabled' if stream_agent else 'disabled'}[/bold]")
         else:
             console.print(f"  AI Fix:   [bold]disabled[/bold] (deterministic fixer only)")

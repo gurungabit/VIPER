@@ -15,7 +15,7 @@ ai:
 
 agent:
   max_iterations: 40
-  max_no_edit_iterations: 10
+  max_no_edit_iterations: 40
   timeout_per_tool: 300
   blocked_commands:
     - "rm -rf /"

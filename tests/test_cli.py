@@ -158,7 +158,7 @@ class TestCLI:
         assert result.exit_code == 0
         assert "orchestrated batched remediation loop" in result.stdout
         assert "Agent Steps: 40" in result.stdout
-        assert "Pre-edit Budget: 10" in result.stdout
+        assert "Pre-edit Budget: same as total step cap" in result.stdout
 
     def test_auto_can_disable_streaming(self):
         """auto should allow hiding live agent stream output."""
@@ -194,7 +194,7 @@ class TestCLI:
 
     def test_auto_passes_agent_iteration_override(self):
         """auto should honor the per-run agent iteration override."""
-        captured_iterations: list[int] = []
+        captured_limits: list[tuple[int, int]] = []
 
         class FakeOrchestrator:
             def __init__(
@@ -207,7 +207,9 @@ class TestCLI:
                 stream_agent,
                 verbose,
             ):
-                captured_iterations.append(config.agent.max_iterations)
+                captured_limits.append(
+                    (config.agent.max_iterations, config.agent.max_no_edit_iterations)
+                )
 
             def run(self):
                 return AutoRunResult(
@@ -225,5 +227,6 @@ class TestCLI:
             )
 
         assert result.exit_code == 0
-        assert captured_iterations == [60]
+        assert captured_limits == [(60, 60)]
         assert "Agent Steps: 60" in result.stdout
+        assert "Pre-edit Budget: same as total step cap" in result.stdout

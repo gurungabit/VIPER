@@ -32,7 +32,7 @@ class AIConfig(BaseModel):
 
 class AgentConfig(BaseModel):
     max_iterations: int = 40
-    max_no_edit_iterations: int = 10
+    max_no_edit_iterations: int = 40
     timeout_per_tool: int = 300
     blocked_commands: list[str] = Field(
         default_factory=lambda: [
