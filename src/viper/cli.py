@@ -79,11 +79,11 @@ def _display_vulns(report: SnykReport, severity_filter: str | None = None) -> in
 
     table = Table(title=f"Vulnerabilities ({len(vulns)} found)", show_lines=True)
     table.add_column("Sev", style="bold", width=8)
-    table.add_column("Package", min_width=20)
-    table.add_column("Version", width=12)
-    table.add_column("Title", min_width=30)
-    table.add_column("Fix?", width=5)
-    table.add_column("ID", style="dim", max_width=35)
+    table.add_column("Package", min_width=18)
+    table.add_column("Current", width=10)
+    table.add_column("Fix Version", width=12)
+    table.add_column("Title", min_width=25)
+    table.add_column("ID", style="dim", max_width=30)
 
     severity_colors = {
         Severity.critical: "red",
@@ -94,12 +94,21 @@ def _display_vulns(report: SnykReport, severity_filter: str | None = None) -> in
 
     for v in sorted(vulns, key=lambda x: x.severity.rank, reverse=True):
         color = severity_colors.get(v.severity, "white")
+        # Extract fix version from upgrade_path
+        fix_ver = ""
+        if v.is_upgradable:
+            for p in v.upgrade_path:
+                if isinstance(p, str) and "@" in p:
+                    fix_ver = p.split("@")[-1]
+                    break
+        fix_display = f"[green]{fix_ver}[/green]" if fix_ver else "[red]N/A[/red]"
+
         table.add_row(
             f"[{color}]{v.severity.value.upper()}[/{color}]",
             v.package_name,
             v.version,
+            fix_display,
             v.title,
-            "[green]Y[/green]" if v.is_upgradable else "[red]N[/red]",
             v.id,
         )
 
@@ -233,17 +242,11 @@ def fix(
     severity: Optional[str] = typer.Option(None, "--severity", "-s", help="Minimum severity"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show changes without applying"),
-    verbose: bool = typer.Option(False, "--verbose", help="Show agent tool calls"),
-    max_iterations: Optional[int] = typer.Option(None, "--max-iterations", help="Max agent loop iterations"),
+    verbose: bool = typer.Option(False, "--verbose", help="Show details"),
 ) -> None:
-    """Analyze and fix vulnerabilities using AI agent."""
+    """Apply Snyk-recommended version fixes directly."""
     try:
         cfg = _load_config(config)
-        if dry_run:
-            cfg.dry_run = True
-        if max_iterations:
-            cfg.agent.max_iterations = max_iterations
-
         target_dir = project_dir or Path.cwd()
 
         if report_file:
@@ -257,31 +260,17 @@ def fix(
 
         _display_vulns(report, severity)
 
-        from viper.agent.loop import ViperAgent
+        from viper.fixer import DirectFixer
 
         console.print()
-        with Progress(
-            SpinnerColumn("dots"),
-            TextColumn("[bold]{task.description}"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=False,
-        ) as progress:
-            task = progress.add_task("AI agent analyzing and fixing vulnerabilities...", total=None)
-            agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
-            result = asyncio.run(agent.run_fix(report))
-            progress.update(task, description="[green]Agent complete")
+        fixer = DirectFixer(project_dir=target_dir, dry_run=dry_run, verbose=True)
+        result = fixer.fix(report)
 
         if result.success:
-            console.print(f"\n[green]Fix complete![/green] {result.summary}")
-            if result.tests_passed is not None:
-                status = "[green]passed[/green]" if result.tests_passed else "[red]failed[/red]"
-                console.print(f"Tests: {status}")
-            for change in result.changes:
-                console.print(f"  Modified: {change.path}")
+            console.print(f"\n[green]Fix complete![/green]")
+            console.print(result.summary)
         else:
-            console.print(f"\n[red]Fix failed:[/red] {result.summary}")
-            raise typer.Exit(1)
+            console.print(f"\n[yellow]No fixes applied:[/yellow] {result.summary}")
 
     except ViperError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -401,15 +390,12 @@ def auto(
     severity: Optional[str] = typer.Option(None, "--severity", "-s", help="Minimum severity"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
     max_cycles: int = typer.Option(5, "--max-cycles", "-n", help="Max scan-fix-validate cycles"),
-    verbose: bool = typer.Option(False, "--verbose", help="Show agent tool calls"),
-    max_iterations: Optional[int] = typer.Option(None, "--max-iterations", help="Max agent iterations per cycle"),
+    verbose: bool = typer.Option(False, "--verbose", help="Show details"),
+    ai_fix: bool = typer.Option(False, "--ai-fix", help="Use AI agent for code changes after version upgrades"),
 ) -> None:
     """Full auto-remediation loop: scan -> fix -> validate, repeat until clean."""
     try:
         cfg = _load_config(config)
-        if max_iterations:
-            cfg.agent.max_iterations = max_iterations
-
         target_dir = project_dir or Path.cwd()
         sev_threshold = severity or cfg.severity_threshold
 
@@ -417,9 +403,11 @@ def auto(
         console.print(f"  Project:  [bold]{target_dir}[/bold]")
         console.print(f"  Severity: [bold]{sev_threshold}[/bold]+")
         console.print(f"  Cycles:   [bold]{max_cycles}[/bold] max")
+        if ai_fix:
+            console.print(f"  AI Fix:   [bold]enabled[/bold] (LLM will handle code changes)")
         console.print()
 
-        from viper.agent.loop import ViperAgent
+        from viper.fixer import DirectFixer
 
         all_changes = []
         total_fixed = 0
@@ -441,7 +429,7 @@ def auto(
                 transient=True,
             ) as progress:
                 progress.add_task(
-                    f"[1/3] Scanning all projects with Snyk...", total=None
+                    "[1/3] Scanning all projects with Snyk...", total=None
                 )
                 try:
                     report = SnykParser.run_scan(
@@ -471,42 +459,39 @@ def auto(
             )
             _display_vulns(report, severity)
 
-            # ── FIX ───────────────────────────────────────────────
+            # ── FIX (Phase 1: Direct version upgrades) ────────────
             console.print()
-            with Progress(
-                SpinnerColumn("dots"),
-                TextColumn("[bold]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=False,
-            ) as progress:
-                task = progress.add_task(
-                    f"[2/3] AI agent analyzing and fixing vulnerabilities...",
-                    total=None,
-                )
-                agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
-                result = asyncio.run(agent.run_fix(report))
-                if result.success:
-                    progress.update(
-                        task,
-                        description=f"[green][2/3] Agent complete ({result.iterations_used} iterations)",
-                    )
-                else:
-                    progress.update(task, description="[red][2/3] Agent failed")
-
-            if not result.success:
-                console.print(f"\n[red]Agent failed:[/red] {result.summary}")
-                console.print(
-                    f"[yellow]Completed {cycle - 1} successful cycle(s), "
-                    f"{total_fixed} vulnerabilities addressed.[/yellow]"
-                )
-                raise typer.Exit(1)
-
-            console.print(f"\n  [green]Agent done:[/green] {result.summary}")
-            if result.changes:
-                for change in result.changes:
-                    console.print(f"    [dim]->[/dim] {change.path}")
+            console.print("[bold][2/3] Applying version upgrades...[/bold]")
+            fixer = DirectFixer(project_dir=target_dir, verbose=True)
+            result = fixer.fix(report)
+            console.print(f"\n{result.summary}")
             all_changes.extend(result.changes)
+
+            # ── FIX (Phase 2: AI agent for code changes, if enabled) ──
+            if ai_fix and result.success:
+                console.print()
+                with Progress(
+                    SpinnerColumn("dots"),
+                    TextColumn("[bold]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                    transient=False,
+                ) as progress:
+                    task = progress.add_task(
+                        "[2/3] AI agent checking for breaking changes...",
+                        total=None,
+                    )
+                    from viper.agent.loop import ViperAgent
+
+                    agent = ViperAgent(config=cfg, project_dir=target_dir, verbose=verbose)
+                    ai_result = asyncio.run(agent.run_fix(report))
+                    if ai_result.success:
+                        progress.update(task, description="[green][2/3] AI agent complete")
+                    else:
+                        progress.update(task, description="[yellow][2/3] AI agent done (partial)")
+                if ai_result.changes:
+                    console.print(f"\n  AI changes: {ai_result.summary}")
+                    all_changes.extend(ai_result.changes)
 
             # ── VALIDATE ──────────────────────────────────────────
             console.print()
