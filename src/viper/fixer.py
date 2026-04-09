@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -17,6 +18,49 @@ from viper.models.vulnerability import SnykReport
 from viper.parsers.snyk_parser import SnykParser
 
 console = Console()
+
+
+def _parse_semver(version: str) -> tuple[int, int, int] | None:
+    """Parse a semver string into (major, minor, patch). Returns None if invalid."""
+    # Strip leading v, ^, ~, >=, etc.
+    cleaned = re.sub(r'^[v^~>=<]*', '', version.strip())
+    match = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?', cleaned)
+    if not match:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2) or 0),
+        int(match.group(3) or 0),
+    )
+
+
+def _is_safe_upgrade(current: str, target: str) -> tuple[bool, str]:
+    """Check if upgrading from current to target is safe.
+
+    Returns (is_safe, reason).
+    Rules:
+    - NEVER downgrade (target major.minor.patch must be >= current)
+    - NEVER cross major versions (e.g. 8.x -> 4.x)
+    """
+    cur = _parse_semver(current)
+    tgt = _parse_semver(target)
+
+    if cur is None or tgt is None:
+        return False, f"cannot parse versions: {current} -> {target}"
+
+    # Never downgrade
+    if tgt < cur:
+        return False, f"BLOCKED: would downgrade {current} -> {target}"
+
+    # Same version = no-op
+    if tgt == cur:
+        return False, f"already at {current}"
+
+    # Warn on major version change
+    if tgt[0] != cur[0]:
+        return False, f"BLOCKED: major version change {current} -> {target} (v{cur[0]} -> v{tgt[0]})"
+
+    return True, "ok"
 
 
 @dataclass
@@ -165,6 +209,13 @@ class DirectFixer:
             max_sev = max(v.severity.value for v in pkg_vulns).upper()
             vuln_ids = [v.id for v in pkg_vulns]
 
+            # Validate the upgrade is safe
+            safe, reason = _is_safe_upgrade(current, fix_version)
+            if not safe:
+                if self.verbose:
+                    console.print(f"  [yellow]Skip {pkg_name}:[/yellow] {reason}")
+                continue
+
             # Check if direct dependency in any dep file
             found_in = []
             for dep_file in dep_files:
@@ -219,6 +270,13 @@ class DirectFixer:
         self, content: str, action: FixAction, file_path: str
     ) -> str | None:
         """Update a direct dependency version in the file content."""
+        # Double-check: never downgrade or cross major versions
+        safe, reason = _is_safe_upgrade(action.current_version, action.fix_version)
+        if not safe:
+            if self.verbose:
+                console.print(f"  [red]BLOCKED {action.package}:[/red] {reason}")
+            return None
+
         if file_path.endswith(".json"):
             # Try exact match: "package": "version"
             # Handle various version prefixes: ^, ~, >=, etc.
@@ -257,6 +315,13 @@ class DirectFixer:
         self, content: str, action: FixAction, file_path: str
     ) -> str | None:
         """Add an npm override for a transitive dependency."""
+        # Double-check: never downgrade or cross major versions
+        safe, reason = _is_safe_upgrade(action.current_version, action.fix_version)
+        if not safe:
+            if self.verbose:
+                console.print(f"  [red]BLOCKED override {action.package}:[/red] {reason}")
+            return None
+
         if not file_path.endswith(".json"):
             return None
 
