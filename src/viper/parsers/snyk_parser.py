@@ -19,7 +19,6 @@ class SnykParser:
         project_dir: Path,
         snyk_token: str | None = None,
         org: str | None = None,
-        severity_threshold: str | None = "medium",
     ) -> SnykReport:
         """Run `snyk test --json` and return parsed report."""
         cmd = [
@@ -27,8 +26,8 @@ class SnykParser:
             "--all-projects", "--detection-depth=4",
             "--exclude=node_modules,.venv,venv,__pycache__,.git,.tox,.eggs,.terraform,vendor",
         ]
-        if severity_threshold:
-            cmd.extend(["--severity-threshold", severity_threshold])
+        # NOTE: --severity-threshold is NOT passed to Snyk because some CLI
+        # versions reject it. We fetch all vulns and filter on our side.
         if org:
             cmd.extend(["--org", org])
 
