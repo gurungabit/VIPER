@@ -323,27 +323,57 @@ def report(
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to viper.yaml"),
     format: str = typer.Option("markdown", "--format", "-f", help="Output format: markdown, json"),
     output_file: Optional[Path] = typer.Option(None, "--output", "-o", help="Write report to file"),
+    code_scan: bool = typer.Option(
+        True,
+        "--code-scan/--no-code-scan",
+        help="Include Snyk Code (SAST) results in the report",
+    ),
 ) -> None:
-    """Generate a vulnerability remediation report."""
+    """Generate a vulnerability remediation report (SCA + SAST)."""
     try:
         cfg = _load_config(config)
         sev_threshold = severity or cfg.severity_threshold
+        target = project_dir or Path.cwd()
 
         if report_file:
             snyk_report = SnykParser.parse_file(report_file)
         else:
-            target = project_dir or Path.cwd()
             snyk_report = _run_scan_with_progress(target, cfg)
 
         snyk_report = _filter_report_by_severity(snyk_report, Severity(sev_threshold))
+
+        # Run code scan if enabled
+        code_report = None
+        if code_scan:
+            from viper.parsers.snyk_code_parser import SnykCodeParser
+
+            try:
+                with Progress(
+                    SpinnerColumn("dots"),
+                    TextColumn("[bold]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                    transient=True,
+                ) as progress:
+                    progress.add_task("Scanning source code with Snyk Code (SAST)...", total=None)
+                    code_report = SnykCodeParser.run_code_scan(
+                        project_dir=target,
+                        snyk_token=cfg.snyk.token or None,
+                        org=cfg.snyk.org or None,
+                    )
+                # Filter code issues by severity
+                filtered_issues = SnykCodeParser.filter_by_severity(code_report, Severity(sev_threshold))
+                code_report = code_report.model_copy(update={"issues": filtered_issues})
+            except ViperError as e:
+                console.print(f"[yellow]Code scan skipped: {e}[/yellow]")
 
         from viper.report_generator import ReportGenerator
 
         generator = ReportGenerator()
         if format == "json":
-            content = generator.generate_json(snyk_report)
+            content = generator.generate_json(snyk_report, code_report)
         else:
-            content = generator.generate_markdown(snyk_report)
+            content = generator.generate_markdown(snyk_report, code_report)
 
         if output_file:
             output_file.write_text(content)
