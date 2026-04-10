@@ -9,7 +9,7 @@ gitlab:
   target_branch: main
 
 ai:
-  model: github_copilot/claude-sonnet-4.6
+  model: github_copilot/claude-haiku-4.5
   temperature: 0.2
   max_tokens: 4096
 
@@ -22,7 +22,6 @@ agent:
     - "sudo"
     - "chmod"
     - "mkfs"
-    - "npm audit"
     - "dd if="
     - "npm audit fix"
     - "npm update"

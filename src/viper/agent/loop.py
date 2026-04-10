@@ -27,6 +27,8 @@ from rich.console import Console
 
 from viper import ViperAgentError
 from viper.agent.prompts import (
+    CODE_FIX_BATCH_USER_PROMPT,
+    CODE_FIX_SYSTEM_PROMPT,
     FIX_BATCH_USER_PROMPT,
     FIX_SYSTEM_PROMPT,
     FIX_UNIT_USER_PROMPT,
@@ -37,6 +39,7 @@ from viper.agent.schemas import TOOL_SCHEMAS
 from viper.agent.tools import ToolExecutor
 from viper.config import ViperConfig
 from viper.fixer import FixAction
+from viper.models.code_issue import CodeIssue, CodeReport
 from viper.models.result import AgentResult, FileChange, ToolCall
 from viper.models.vulnerability import SnykReport
 
@@ -254,7 +257,15 @@ class ViperAgent:
             # Force tool use until the agent has actually edited files or
             # explicitly called done(). This prevents it from just reading
             # files and then responding with text.
+            # Also force tool use if verification hasn't been done yet after edits.
+            needs_verification = (
+                has_made_edits
+                and not self.tool_executor.is_done
+                and bool(self.tool_executor.missing_verifications())
+            )
             if not has_made_edits and not self.tool_executor.is_done:
+                tool_choice = "required"
+            elif needs_verification:
                 tool_choice = "required"
             else:
                 tool_choice = "auto"
@@ -284,8 +295,41 @@ class ViperAgent:
             if not message.tool_calls:
                 text_only_count += 1
 
-                # Only stop if agent has made edits or called done()
-                if has_made_edits or self.tool_executor.is_done:
+                # If agent called done() explicitly, respect it
+                if self.tool_executor.is_done:
+                    self._emit("completed")
+                    return AgentResult(
+                        success=True,
+                        summary=message.content or "Changes applied.",
+                        iterations_used=iteration + 1,
+                        tool_calls=all_tool_calls,
+                        changes=[
+                            FileChange(path=c["path"])
+                            for c in self.tool_executor.changes
+                        ],
+                    )
+
+                # If agent made edits but hasn't run verification, nudge it
+                if has_made_edits:
+                    missing_verification = self.tool_executor.missing_verifications()
+
+                    if missing_verification:
+                        self._emit(
+                            "nudge",
+                            message=f"Agent must run {' and '.join(missing_verification)} before finishing.",
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"You made file changes but have not yet run "
+                                f"{' or '.join(missing_verification)} to verify your fixes. "
+                                f"You MUST run these verification commands now. "
+                                f"Then call done() with the results. Do it now."
+                            ),
+                        })
+                        continue
+
+                    # Verification done, agent can finish
                     self._emit("completed")
                     return AgentResult(
                         success=True,
@@ -418,20 +462,24 @@ class ViperAgent:
 
             if has_made_edits and not self.tool_executor.is_done:
                 edit_completion_nudges += 1
-                if edit_completion_nudges >= 4:
+                if edit_completion_nudges >= 10:
                     self._emit(
                         "nudge",
                         message=(
-                            "Agent has already edited files. Stop researching and either call done() "
-                            "or perform one final focused verification step."
+                            "Agent has been working for many iterations after editing files. "
+                            "Wrap up: ensure npm install succeeds, run npm audit and snyk test, "
+                            "then call done()."
                         ),
                     )
                     messages.append({
                         "role": "user",
                         "content": (
-                            "You already changed files for this unit. Do not keep researching the registry. "
-                            "Perform at most one final focused verification command, then call done(). "
-                            "The orchestrator will run the authoritative Snyk rescan after you finish."
+                            "You have been working for many iterations. Make sure:\n"
+                            "1. npm install completes successfully\n"
+                            "2. npm audit shows no high/critical issues\n"
+                            "3. snyk test shows no high/critical issues\n"
+                            "If install is failing, fix the version conflicts first. "
+                            "Then call done() with a summary."
                         ),
                     })
                     edit_completion_nudges = 0
@@ -599,6 +647,63 @@ class ViperAgent:
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": FIX_BATCH_USER_PROMPT},
+        ]
+        return await self._run_messages(messages)
+
+    async def run_fix_code_batch(
+        self,
+        code_report: CodeReport,
+        issues: list[CodeIssue],
+        feedback: str | None = None,
+    ) -> AgentResult:
+        """Run the agent against a batch of SAST code issues."""
+        if not issues:
+            return AgentResult(
+                success=True,
+                summary="No code issues to fix.",
+                iterations_used=0,
+            )
+
+        # Set verification mode to SAST
+        self.tool_executor.set_verification_mode("sast")
+
+        # Build issue context
+        issue_context = [
+            "SELECTED CODE ISSUE BATCH:",
+            f"- issue_count: {len(issues)}",
+            "",
+            "ISSUES:",
+        ]
+
+        for idx, issue in enumerate(issues, start=1):
+            issue_context.extend([
+                f"{idx}. [{issue.severity.value.upper()}] {issue.rule_id}",
+                f"   Rule: {issue.rule_name or issue.rule_id}",
+                f"   File: {issue.file_path}:{issue.start_line}-{issue.end_line}",
+                f"   Message: {issue.message}",
+            ])
+            if issue.is_autofixable:
+                issue_context.append("   Autofixable: yes")
+            if issue.code_flow:
+                issue_context.append("   Data flow trace:")
+                for step in issue.code_flow[:8]:
+                    issue_context.append(
+                        f"     -> {step.file_path}:{step.start_line}"
+                    )
+            issue_context.append("")
+
+        if feedback:
+            issue_context.append("RETRY FEEDBACK:")
+            issue_context.append(feedback)
+
+        system_prompt = CODE_FIX_SYSTEM_PROMPT.format(
+            code_issues="\n".join(issue_context),
+            project_dir=str(self.project_dir),
+        )
+
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": CODE_FIX_BATCH_USER_PROMPT},
         ]
         return await self._run_messages(messages)
 

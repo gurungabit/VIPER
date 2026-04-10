@@ -118,6 +118,7 @@ class TestCLI:
                 use_ai,
                 stream_agent,
                 verbose,
+                **kwargs,
             ):
                 captured["severity_threshold"] = severity_threshold
                 captured["stream_agent"] = stream_agent
@@ -156,7 +157,7 @@ class TestCLI:
             result = runner.invoke(app, ["auto", "--project-dir", "/tmp"])
 
         assert result.exit_code == 0
-        assert "orchestrated batched remediation loop" in result.stdout
+        assert "AI agent handles all remediation" in result.stdout
         assert "Agent Steps: 40" in result.stdout
         assert "Pre-edit Budget: same as total step cap" in result.stdout
 
@@ -174,6 +175,7 @@ class TestCLI:
                 use_ai,
                 stream_agent,
                 verbose,
+                **kwargs,
             ):
                 captured["stream_agent"] = stream_agent
 
@@ -206,6 +208,7 @@ class TestCLI:
                 use_ai,
                 stream_agent,
                 verbose,
+                **kwargs,
             ):
                 captured_limits.append(
                     (config.agent.max_iterations, config.agent.max_no_edit_iterations)

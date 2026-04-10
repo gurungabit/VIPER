@@ -76,9 +76,7 @@ class ToolExecutor:
             "chmod",
             "mkfs",
             "dd if=",
-            "npm audit",
             "npm audit fix",
-            "yarn audit",
             "npm update",
             "yarn upgrade",
             "yarn up",
@@ -89,6 +87,11 @@ class ToolExecutor:
         self._changes: list[dict] = []
         self._done = False
         self._done_result: dict | None = None
+        self._ran_npm_audit = False
+        self._ran_snyk_test = False
+        self._ran_snyk_code_test = False
+        self._ran_project_tests = False
+        self._verification_mode: str = "sca"  # "sca" or "sast"
 
     @property
     def is_done(self) -> bool:
@@ -97,6 +100,27 @@ class ToolExecutor:
     @property
     def done_result(self) -> dict | None:
         return self._done_result
+
+    def set_verification_mode(self, mode: str) -> None:
+        """Set verification mode: 'sca' for dependency scans, 'sast' for code scans."""
+        self._verification_mode = mode
+
+    def missing_verifications(self) -> list[str]:
+        """Return list of verification commands that haven't been run yet."""
+        if not self._changes:
+            return []
+        missing: list[str] = []
+        if self._verification_mode == "sca":
+            if not self._ran_npm_audit:
+                missing.append("`npm audit`")
+            if not self._ran_snyk_test:
+                missing.append("`snyk test`")
+        elif self._verification_mode == "sast":
+            if not self._ran_project_tests:
+                missing.append("project tests/build (e.g. `npm test`, `npm run build`)")
+            if not self._ran_snyk_code_test:
+                missing.append("`snyk code test`")
+        return missing
 
     @property
     def changes(self) -> list[dict]:
@@ -139,6 +163,27 @@ class ToolExecutor:
         for blocked in self.blocked_commands:
             if blocked in command:
                 return f"Error: Command blocked for safety (contains '{blocked}')"
+
+        # Track verification commands (check "snyk code test" BEFORE "snyk test"
+        # to avoid false positive on the shorter match)
+        if "npm audit" in command and "fix" not in command:
+            self._ran_npm_audit = True
+        if "snyk code test" in command:
+            self._ran_snyk_code_test = True
+        elif "snyk test" in command:
+            self._ran_snyk_test = True
+
+        # Track project test/build commands
+        test_build_patterns = [
+            "npm test", "npm run test", "npm run build", "npx tsc",
+            "pytest", "python -m pytest", "python -m unittest",
+            "yarn test", "yarn build", "pnpm test", "pnpm build",
+            "mvn test", "gradle test", "go test",
+        ]
+        for pattern in test_build_patterns:
+            if pattern in command:
+                self._ran_project_tests = True
+                break
 
         effective_timeout = timeout or self.timeout
 
@@ -315,7 +360,16 @@ class ToolExecutor:
         changes: list[dict] | None = None,
         tests_passed: bool | None = None,
     ) -> str:
-        """Signal task completion."""
+        """Signal task completion. Rejected if verification steps were skipped."""
+        missing = self.missing_verifications()
+
+        if missing:
+            return (
+                f"Error: Cannot call done() yet. You made file changes but have not "
+                f"run {' or '.join(missing)} to verify the fixes. "
+                f"Run these verification commands first, then call done() again."
+            )
+
         self._done = True
         self._done_result = {
             "summary": summary,

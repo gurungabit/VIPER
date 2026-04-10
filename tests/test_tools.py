@@ -80,8 +80,13 @@ class TestToolExecutor:
         result = executor.execute("bash", {"command": "npm audit fix"})
         assert "blocked" in result.lower()
 
-    def test_bash_blocks_plain_npm_audit(self, executor: ToolExecutor):
+    def test_bash_allows_npm_audit_read_only(self, executor: ToolExecutor):
+        """npm audit (read-only scan) should be allowed; only npm audit fix is blocked."""
         result = executor.execute("bash", {"command": "npm audit"})
+        assert "blocked" not in result.lower()
+
+    def test_bash_blocks_npm_audit_fix(self, executor: ToolExecutor):
+        result = executor.execute("bash", {"command": "npm audit fix"})
         assert "blocked" in result.lower()
 
     def test_done(self, executor: ToolExecutor):

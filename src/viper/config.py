@@ -25,7 +25,7 @@ class GitLabConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    model: str = "github_copilot/claude-sonnet-4.6"
+    model: str = "github_copilot/claude-haiku-4.5"
     temperature: float = 0.2
     max_tokens: int = 4096
 
@@ -41,9 +41,7 @@ class AgentConfig(BaseModel):
             "chmod",
             "mkfs",
             "dd if=",
-            "npm audit",
             "npm audit fix",
-            "yarn audit",
             "npm update",
             "yarn upgrade",
             "yarn up",

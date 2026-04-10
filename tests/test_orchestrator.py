@@ -87,14 +87,14 @@ class TestRemediationOrchestrator:
         assert result.cycles_completed == 1
         assert run_agent.call_count == 2
 
-    def test_falls_back_to_batched_deterministic_fix(self, tmp_path: Path):
+    def test_retries_when_agent_makes_no_changes(self, tmp_path: Path):
+        """When AI agent makes no changes, orchestrator should retry (no deterministic fallback)."""
         _write_package_json(
             tmp_path / "package.json",
             '{\n  "name": "my-project",\n  "dependencies": {\n    "lodash": "^4.17.15"\n  }\n}\n',
         )
 
         vuln_report = _build_lodash_report()
-        clean_report = SnykReport(ok=True, vulnerabilities=[], dependency_count=3)
 
         orchestrator = RemediationOrchestrator(
             config=ViperConfig(),
@@ -106,15 +106,9 @@ class TestRemediationOrchestrator:
             verbose=False,
         )
 
-        fallback_result = AgentResult(
-            success=True,
-            summary="Upgraded 1 package:\n  [HIGH] lodash: 4.17.15 -> 4.17.21",
-            changes=[FileChange(path="package.json")],
-        )
-
         with patch(
             "viper.orchestrator.SnykParser.run_scan",
-            side_effect=[vuln_report, clean_report],
+            return_value=vuln_report,
         ), patch.object(
             RemediationOrchestrator,
             "_run_agent_for_batch",
@@ -123,15 +117,13 @@ class TestRemediationOrchestrator:
                 summary="Agent explored but made no changes",
                 changes=[],
             ),
-        ), patch(
-            "viper.orchestrator.DirectFixer.fix_actions",
-            return_value=fallback_result,
-        ) as fix_actions:
+        ) as run_agent:
             result = orchestrator.run()
 
-        assert result.clean is True
-        assert result.total_fixed >= 1
-        fix_actions.assert_called_once()
+        # Agent should be called up to max_attempts_per_batch (3) times
+        assert run_agent.call_count == 3
+        # No progress means orchestrator stops
+        assert result.clean is False
 
     def test_stops_when_no_safe_actionable_units_exist(self, tmp_path: Path):
         _write_package_json(

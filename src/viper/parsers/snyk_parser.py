@@ -52,8 +52,11 @@ class SnykParser:
         if snyk_token:
             env["SNYK_TOKEN"] = snyk_token
 
-        # Check SNYK_TOKEN is available
-        if not env.get("SNYK_TOKEN"):
+        # Check authentication is available — either SNYK_TOKEN env var
+        # or an existing Snyk OAuth session (from `snyk auth`).
+        snyk_oauth_config = Path.home() / ".config" / "configstore" / "snyk.json"
+        has_oauth = snyk_oauth_config.exists()
+        if not env.get("SNYK_TOKEN") and not has_oauth:
             raise ViperScanError(
                 "SNYK_TOKEN not set. Either:\n"
                 "  1. Set the SNYK_TOKEN environment variable: export SNYK_TOKEN=<token>\n"
